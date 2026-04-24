@@ -3,7 +3,7 @@ name: Build Client
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
 
 jobs:
@@ -12,14 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: windows-latest
-            args: '--target x86_64-pc-windows-msvc'
           - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
+            args: "--target aarch64-apple-darwin"
           - platform: macos-latest
-            args: '--target x86_64-apple-darwin'
-          - platform: ubuntu-22.04
-            args: ''
+            args: "--target x86_64-apple-darwin"
 
     runs-on: ${{ matrix.platform }}
 
@@ -29,8 +25,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: "20"
+          cache: "npm"
           cache-dependency-path: client/package-lock.json
 
       - name: Install Rust
@@ -41,38 +37,35 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: './client/src-tauri -> target'
-
-      - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf
+          workspaces: "./client/src-tauri -> target"
 
       - name: Install frontend dependencies
         working-directory: client
         run: npm install
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS 签名（可选，没有证书可以不填）
-          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # APPLE_ID: ${{ secrets.APPLE_ID }}
-          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        working-directory: client
+        run: npm run tauri build -- ${{ matrix.args }}
+
+      - name: Upload macOS artifacts
+        if: matrix.platform == 'macos-latest'
+        uses: actions/upload-artifact@v4
         with:
-          projectPath: client
-          tagName: ${{ github.ref_name }}
-          releaseName: 'IPAMS Client ${{ github.ref_name }}'
-          releaseBody: 'See the assets below to download the installer for your platform.'
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+          name: macos-${{ matrix.args == '--target aarch64-apple-darwin' && 'arm64' || 'x64' }}
+          path: |
+            client/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            client/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+
+      - name: Upload Windows artifacts
+        if: matrix.platform == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: client/src-tauri/target/release/bundle/msi/*.msi
+
+      - name: Upload Linux artifacts
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: client/src-tauri/target/release/bundle/deb/*.deb
