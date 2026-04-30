@@ -173,15 +173,24 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
 
     ws.onmessage = (event) => {
       try {
-        const msg: WsProgressMessage
+        const msg: WsProgressMessage = JSON.parse(event.data);
+        get()._updateTaskFromWs(msg);
+      } catch {
+        // ignore parse errors
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("WS disconnected, reconnecting in 3s...");
+      set({ wsConnected: false, wsClient: null });
+      setTimeout(() => {
+        if (!get().wsClient) get().connectWs();
       }, 3000);
     };
 
     ws.onerror = (err) => {
       console.error("WS error:", err);
     };
-
-    set({ wsClient: ws });
   },
 
   disconnectWs: () => {
