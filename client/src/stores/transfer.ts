@@ -150,30 +150,30 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
     if (wsClient) return; // Already connected
 
     const port = config?.ws_port ?? 17892;
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    } catch (err) {
+      console.error("Failed to create WebSocket:", err);
+      setTimeout(() => {
+        if (!get().wsClient) get().connectWs();
+      }, 5000);
+      return;
+    }
+
+    // Set client immediately so duplicate calls are blocked
+    set({ wsClient: ws });
 
     ws.onopen = () => {
-      console.log("WS connected");
+      console.log("WS connected to port", port);
       set({ wsConnected: true });
+      // Load tasks once connected
+      get().loadTasks();
     };
 
     ws.onmessage = (event) => {
       try {
-        const msg: WsProgressMessage = JSON.parse(event.data);
-        get()._updateTaskFromWs(msg);
-      } catch {
-        // ignore parse errors
-      }
-    };
-
-    ws.onclose = () => {
-      console.log("WS disconnected, reconnecting in 3s...");
-      set({ wsConnected: false, wsClient: null });
-      // Reconnect after delay
-      setTimeout(() => {
-        if (!get().wsClient) {
-          get().connectWs();
-        }
+        const msg: WsProgressMessage
       }, 3000);
     };
 

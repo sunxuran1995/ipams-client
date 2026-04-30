@@ -56,7 +56,7 @@ pub async fn start_ws_server(port: u16) -> Result<()> {
 }
 
 /// Peek at the first bytes to decide whether to handle as WS upgrade or HTTP.
-async fn dispatch_connection(mut stream: TcpStream, server: Arc<WsServer>) -> Result<()> {
+async fn dispatch_connection(stream: TcpStream, server: Arc<WsServer>) -> Result<()> {
     let mut peek_buf = [0u8; 512];
     let n = stream.peek(&mut peek_buf).await?;
     let header = std::str::from_utf8(&peek_buf[..n]).unwrap_or("");

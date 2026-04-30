@@ -54,9 +54,9 @@ fn get_current_username() -> Option<String> {
         };
         let decoded = base64_url_decode(&padded);
         serde_json::from_slice::<serde_json::Value>(&decoded).ok().and_then(|payload| {
-            payload["username"].as_str()
+            payload["display_name"].as_str()
                 .or_else(|| payload["name"].as_str())
-                .or_else(|| payload["display_name"].as_str())
+                .or_else(|| payload["username"].as_str())
                 .map(|s| s.to_string())
         })
     })
@@ -129,35 +129,34 @@ pub fn run() {
 
     tracing::info!("Starting IPAMS Client");
 
-    tauri::Builder::default()
-        // Single-instance: 若已有实例运行，将启动参数转发给它并退出
-        // (仅 Windows/Linux 支持，macOS 通过系统机制保证单实例)
-        #[cfg(not(target_os = "macos"))]
-        .plugin(
-            tauri_plugin_single_instance::init(|app, argv, _cwd| {
-                // argv 包含第二个实例的命令行参数，其中可能含 ipams:// URL
-                tracing::info!("Second instance launched, argv: {:?}", argv);
-                // 聚焦已有窗口
-                use tauri::Manager;
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
+    let builder = tauri::Builder::default();
+
+    // Single-instance: 仅 Windows/Linux 支持，macOS 通过系统机制保证单实例
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(
+        tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            tracing::info!("Second instance launched, argv: {:?}", argv);
+            use tauri::Manager;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            let handle = app.clone();
+            for arg in &argv {
+                if arg.starts_with("ipams://") {
+                    let url = arg.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = deep_link::handle_deep_link(&handle, &url).await {
+                            tracing::error!("Deep link (second instance) error: {}", e);
+                        }
+                    });
+                    break;
                 }
-                // 从参数中提取 ipams:// URL 并处理
-                let handle = app.clone();
-                for arg in &argv {
-                    if arg.starts_with("ipams://") {
-                        let url = arg.clone();
-                        tauri::async_runtime::spawn(async move {
-                            if let Err(e) = deep_link::handle_deep_link(&handle, &url).await {
-                                tracing::error!("Deep link (second instance) error: {}", e);
-                            }
-                        });
-                        break;
-                    }
-                }
-            }),
-        )
+            }
+        }),
+    );
+
+    builder
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
