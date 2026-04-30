@@ -131,6 +131,8 @@ pub fn run() {
 
     tauri::Builder::default()
         // Single-instance: 若已有实例运行，将启动参数转发给它并退出
+        // (仅 Windows/Linux 支持，macOS 通过系统机制保证单实例)
+        #[cfg(not(target_os = "macos"))]
         .plugin(
             tauri_plugin_single_instance::init(|app, argv, _cwd| {
                 // argv 包含第二个实例的命令行参数，其中可能含 ipams:// URL

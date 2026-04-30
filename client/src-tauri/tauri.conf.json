@@ -27,13 +27,6 @@
     ],
     "security": {
       "csp": null
-    },
-    "trayIcon": {
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": true,
-      "menuOnLeftClick": false,
-      "title": "IPAMS Client",
-      "tooltip": "IPAMS 传输客户端"
     }
   },
   "bundle": {
@@ -62,7 +55,8 @@
       "exceptionDomain": "",
       "frameworks": [],
       "providerShortName": null,
-      "signingIdentity": null
+      "signingIdentity": null,
+      "infoPlist": "./Info.plist"
     }
   },
   "plugins": {

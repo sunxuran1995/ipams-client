@@ -183,6 +183,9 @@ pub async fn enqueue_upload<R: Runtime>(app: &AppHandle<R>, upload_id: &str, tok
         }),
     );
 
+    // Show window before file picker (required on macOS)
+    crate::tray::show_window(app);
+
     // Show file picker dialog, then start upload
     let app_clone = app.clone();
     let upload_id_owned = upload_id.to_string();
