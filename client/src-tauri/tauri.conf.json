@@ -56,9 +56,7 @@
       "frameworks": [],
       "providerShortName": null,
       "signingIdentity": null,
-      "infoPlist": {
-        "LSUIElement": true
-      }
+      "infoPlist": "Info.plist"
     }
   },
   "plugins": {
