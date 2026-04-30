@@ -193,29 +193,25 @@ pub fn run() {
                 manager::resume_pending_tasks(resume_token).await;
             });
 
-            // Register deep link handler
-            let handle2 = handle.clone();
-            app.listen("deep-link://new-url", move |event: tauri::Event| {
-                let raw = event.payload().to_string();
-                // Strip surrounding quotes if present (Tauri serialises strings as JSON)
-                let url = raw
-                    .strip_prefix('"')
-                    .and_then(|s: &str| s.strip_suffix('"'))
-                    .unwrap_or(&raw)
-                    .replace("\\\"", "\"")
-                    .to_string();
-
-                let handle3 = handle2.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(e) = deep_link::handle_deep_link(&handle3, &url).await {
-                        tracing::error!("Deep link error: {}", e);
+            // Register deep link handler using the correct Tauri 2 API
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle2 = handle.clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        let url_str = url.to_string();
+                        tracing::info!("Deep link received: {}", url_str);
+                        let handle3 = handle2.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = deep_link::handle_deep_link(&handle3, &url_str).await {
+                                tracing::error!("Deep link error: {}", e);
+                            }
+                            manager::reload_tasks_for_current_user().await;
+                            let _ = handle3.emit("tasks:reloaded", ());
+                        });
                     }
-                    // token 保存后重载当前用户的任务列表
-                    manager::reload_tasks_for_current_user().await;
-                    // 通知前端刷新任务列表
-                    let _ = handle3.emit("tasks:reloaded", ());
                 });
-            });
+            }
 
             // 启动时登录检查：
             // 若命令行参数中已有 ipams:// 深链接（冷启动场景），跳过检查
