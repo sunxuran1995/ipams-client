@@ -1,7 +1,7 @@
 use super::{TaskStatus, TransferTask, UploadTaskDetail};
 use crate::transfer::upload::Uploader;
 use crate::ws_server;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -321,19 +321,8 @@ async fn start_upload(
             let err_str = e.to_string();
             tracing::error!("Upload {} failed: {}", upload_id, err_str);
             update_task_status(&upload_id, TaskStatus::Failed, Some(err_str)).await;
-            // 通知后端 abort，把 asset 状态改为 deleted，避免前端一直显示上传中
-            let upload_id_owned = upload_id.clone();
-            tokio::spawn(async move {
-                if let Some(token) = crate::auth::load_token() {
-                    let cfg = crate::config::get_config();
-                    let client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(10))
-                        .build()
-                        .unwrap_or_default();
-                    let url = format!("{}/api/v1/upload/{}/abort", cfg.api_url, upload_id_owned);
-                    let _ = client.delete(&url).bearer_auth(&token).send().await;
-                }
-            });
+            // 不调用 /abort，保留后端 upload_task 状态，允许用户续传
+            // 只有用户主动取消时才 abort（见 cancel_task）
         }
     }
 
@@ -404,7 +393,7 @@ pub async fn resume_task(upload_id: &str) -> bool {
     let task = {
         let mut store = TASK_STORE.write().await;
         match store.get_mut(upload_id) {
-            Some(task) if task.status == TaskStatus::Paused => {
+            Some(task) if task.status == TaskStatus::Paused || task.status == TaskStatus::Failed => {
                 task.status = TaskStatus::Pending;
                 let cloned = task.clone();
                 save_tasks_to_disk(&store);
@@ -433,10 +422,25 @@ pub async fn resume_task(upload_id: &str) -> bool {
             let token = crate::auth::load_token();
             tokio::spawn(async move {
                 let cfg = crate::config::get_config();
+
+                // 检查后端 upload_task 状态，如果是 aborted/failed/completed 则需要重新 init
+                let effective_upload_id = if let Some(ref tok) = token {
+                    match check_and_reinit_upload(&upload_id_owned, &task_clone, tok, &cfg).await {
+                        Ok(new_id) => new_id,
+                        Err(e) => {
+                            tracing::error!("Failed to check/reinit upload {}: {}", upload_id_owned, e);
+                            update_task_status(&upload_id_owned, TaskStatus::Failed, Some(e.to_string())).await;
+                            return;
+                        }
+                    }
+                } else {
+                    upload_id_owned.clone()
+                };
+
                 // 优先用保存的 chunk_size，保证续传时分片边界一致
                 let chunk_size = task_clone.chunk_size.unwrap_or(cfg.chunk_size as u64);
                 let detail = crate::transfer::UploadTaskDetail {
-                    upload_id: upload_id_owned.clone(),
+                    upload_id: effective_upload_id.clone(),
                     asset_id: String::new(),
                     original_filename: task_clone.filename.clone(),
                     file_size: task_clone.file_size,
@@ -446,7 +450,7 @@ pub async fn resume_task(upload_id: &str) -> bool {
                     oss_path: String::new(),
                     oss_upload_id: None,
                 };
-                if let Err(e) = start_upload(upload_id_owned.clone(), file_path, detail, token).await {
+                if let Err(e) = start_upload(effective_upload_id.clone(), file_path, detail, token).await {
                     tracing::error!("Resume upload failed: {}", e);
                 }
             });
@@ -459,6 +463,139 @@ pub async fn resume_task(upload_id: &str) -> bool {
         }
     }
     false
+}
+
+/// 检查后端 upload_task 状态，如果不可续传（aborted/failed/completed）则重新 init，
+/// 返回实际应使用的 upload_id（可能是新的）
+async fn check_and_reinit_upload(
+    upload_id: &str,
+    task: &TransferTask,
+    token: &str,
+    cfg: &crate::config::AppConfig,
+) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    // 查询后端进度，判断状态
+    let progress_url = format!("{}/api/v1/upload/{}/progress", cfg.api_url, upload_id);
+    let needs_reinit = match client.get(&progress_url).bearer_auth(token).send().await {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            let status = body["data"]["status"].as_str().unwrap_or("");
+            tracing::info!("Backend upload {} status: {}", upload_id, status);
+            matches!(status, "aborted" | "failed" | "completed")
+        }
+        Ok(r) if r.status() == 404 => {
+            tracing::info!("Upload task {} not found on backend, will reinit", upload_id);
+            true
+        }
+        Ok(r) => {
+            tracing::warn!("Unexpected status {} checking upload {}", r.status(), upload_id);
+            false
+        }
+        Err(e) => {
+            tracing::warn!("Failed to check upload status for {}: {}", upload_id, e);
+            false
+        }
+    };
+
+    if !needs_reinit {
+        return Ok(upload_id.to_string());
+    }
+
+    tracing::info!("Reinitializing upload for task {} (file: {})", upload_id, task.filename);
+
+    // 从旧 upload_task 的 progress 接口拿 asset_id，再查 asset 获取 project_id / folder_id
+    let progress_url = format!("{}/api/v1/upload/{}/progress", cfg.api_url, upload_id);
+    let (project_id, folder_id) = match client.get(&progress_url).bearer_auth(token).send().await {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            let asset_id = body["data"]["asset_id"].as_str().unwrap_or("").to_string();
+            if asset_id.is_empty() {
+                (None, None)
+            } else {
+                let asset_url = format!("{}/api/v1/assets/{}", cfg.api_url, asset_id);
+                match client.get(&asset_url).bearer_auth(token).send().await {
+                    Ok(ar) if ar.status().is_success() => {
+                        let av: serde_json::Value = ar.json().await.unwrap_or_default();
+                        let pid = av["data"]["project_id"].as_str().map(|s| s.to_string());
+                        let fid = av["data"]["folder_id"].as_str().map(|s| s.to_string());
+                        (pid, fid)
+                    }
+                    _ => (None, None),
+                }
+            }
+        }
+        _ => (None, None),
+    };
+
+    let project_id = match project_id {
+        Some(p) => p,
+        None => {
+            return Err(anyhow::anyhow!(
+                "Cannot reinit upload: unable to determine project_id for task {}",
+                upload_id
+            ));
+        }
+    };
+
+    // 重新调用 /upload/init
+    let init_url = format!("{}/api/v1/upload/init", cfg.api_url);
+    let init_body = serde_json::json!({
+        "filename": task.filename,
+        "file_size": task.file_size,
+        "project_id": project_id,
+        "folder_id": folder_id,
+    });
+
+    let resp = client
+        .post(&init_url)
+        .bearer_auth(token)
+        .json(&init_body)
+        .send()
+        .await
+        .context("Failed to reinit upload")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("Reinit upload API error {}: {}", status, text));
+    }
+
+    let wrapper: serde_json::Value = resp.json().await.context("Failed to parse reinit response")?;
+    let new_upload_id = wrapper["data"]["upload_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No upload_id in reinit response"))?
+        .to_string();
+
+    let new_total_chunks = wrapper["data"]["total_chunks"]
+        .as_u64()
+        .unwrap_or(task.total_chunks as u64) as u32;
+    let new_chunk_size = wrapper["data"]["chunk_size"]
+        .as_u64()
+        .unwrap_or(task.chunk_size.unwrap_or(10 * 1024 * 1024));
+
+    tracing::info!("Reinitialized upload: old={} new={}", upload_id, new_upload_id);
+
+    // 更新本地 task store：用新的 upload_id 替换旧的
+    {
+        let mut store = TASK_STORE.write().await;
+        if let Some(old_task) = store.remove(upload_id) {
+            let mut new_task = old_task;
+            new_task.upload_id = new_upload_id.clone();
+            new_task.total_chunks = new_total_chunks;
+            new_task.chunk_size = Some(new_chunk_size);
+            new_task.uploaded_chunks = 0;
+            new_task.status = TaskStatus::Pending;
+            new_task.error = None;
+            store.insert(new_upload_id.clone(), new_task);
+            save_tasks_to_disk(&store);
+        }
+    }
+
+    Ok(new_upload_id)
 }
 
 /// New entry point: pick files/folder first, then call /upload/init, then upload.
@@ -861,5 +998,54 @@ pub async fn resume_pending_tasks(_token: Option<String>) {
                 tracing::error!("Resume: upload failed for {}: {}", upload_id, e);
             }
         });
+    }
+}
+
+/// 暂停所有正在运行或等待中的任务
+pub async fn pause_all_tasks() {
+    let upload_ids: Vec<String> = {
+        let store = TASK_STORE.read().await;
+        store
+            .values()
+            .filter(|t| t.status == TaskStatus::Running || t.status == TaskStatus::Pending)
+            .map(|t| t.upload_id.clone())
+            .collect()
+    };
+    for upload_id in upload_ids {
+        pause_task(&upload_id).await;
+    }
+}
+
+/// 恢复所有已暂停的任务
+pub async fn resume_all_tasks() {
+    let upload_ids: Vec<String> = {
+        let store = TASK_STORE.read().await;
+        store
+            .values()
+            .filter(|t| t.status == TaskStatus::Paused)
+            .map(|t| t.upload_id.clone())
+            .collect()
+    };
+    for upload_id in upload_ids {
+        resume_task(&upload_id).await;
+    }
+}
+
+/// 取消所有活跃任务
+pub async fn cancel_all_tasks() {
+    let upload_ids: Vec<String> = {
+        let store = TASK_STORE.read().await;
+        store
+            .values()
+            .filter(|t| {
+                t.status == TaskStatus::Running
+                    || t.status == TaskStatus::Pending
+                    || t.status == TaskStatus::Paused
+            })
+            .map(|t| t.upload_id.clone())
+            .collect()
+    };
+    for upload_id in upload_ids {
+        cancel_task(&upload_id).await;
     }
 }

@@ -109,6 +109,10 @@ async fn handle_ws(stream: TcpStream, server: Arc<WsServer>) -> Result<()> {
                     Some(Ok(Message::Ping(data))) => {
                         let _ = write.send(Message::Pong(data)).await;
                     }
+                    Some(Ok(Message::Text(text))) => {
+                        // 处理来自浏览器的控制命令
+                        handle_ws_command(&text).await;
+                    }
                     Some(Ok(Message::Close(_))) | None => {
                         tracing::info!("WebSocket client {} disconnected", id);
                         break;
@@ -126,6 +130,44 @@ async fn handle_ws(stream: TcpStream, server: Arc<WsServer>) -> Result<()> {
     Ok(())
 }
 
+/// 处理浏览器通过 WebSocket 发来的控制命令
+async fn handle_ws_command(text: &str) {
+    let Ok(cmd) = serde_json::from_str::<Value>(text) else {
+        return;
+    };
+    let cmd_type = cmd["type"].as_str().unwrap_or("");
+    tracing::debug!("WS command received: {}", cmd_type);
+    match cmd_type {
+        "pause_all" => {
+            crate::transfer::manager::pause_all_tasks().await;
+        }
+        "resume_all" => {
+            crate::transfer::manager::resume_all_tasks().await;
+        }
+        "pause" => {
+            if let Some(upload_id) = cmd["upload_id"].as_str() {
+                crate::transfer::manager::pause_task(upload_id).await;
+            }
+        }
+        "resume" => {
+            if let Some(upload_id) = cmd["upload_id"].as_str() {
+                crate::transfer::manager::resume_task(upload_id).await;
+            }
+        }
+        "cancel" => {
+            if let Some(upload_id) = cmd["upload_id"].as_str() {
+                crate::transfer::manager::cancel_task(upload_id).await;
+            }
+        }
+        "cancel_all" => {
+            crate::transfer::manager::cancel_all_tasks().await;
+        }
+        _ => {
+            tracing::debug!("Unknown WS command: {}", cmd_type);
+        }
+    }
+}
+
 async fn handle_http_ping(mut stream: TcpStream, request: String) -> Result<()> {
     let path = request
         .lines()
@@ -133,13 +175,32 @@ async fn handle_http_ping(mut stream: TcpStream, request: String) -> Result<()> 
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/");
 
-    let (status, body) = if path == "/ping" {
-        (
+    // 处理 CORS 预检请求
+    let method = request
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or("GET");
+
+    if method == "OPTIONS" {
+        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n";
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
+
+    let (status, body) = match path {
+        "/ping" => (
             "200 OK",
-            r#"{"status":"ok","service":"ipams-client"}"#,
-        )
-    } else {
-        ("404 Not Found", r#"{"error":"not found"}"#)
+            r#"{"status":"ok","service":"ipams-client"}"#.to_string(),
+        ),
+        "/pause-all" => {
+            // 同步暂停所有任务（供 beforeunload 通过 fetch keepalive 调用）
+            crate::transfer::manager::pause_all_tasks().await;
+            tracing::info!("HTTP /pause-all: paused all active tasks");
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        }
+        _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
     };
 
     let response = format!(

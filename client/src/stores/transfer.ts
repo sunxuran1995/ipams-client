@@ -45,12 +45,16 @@ interface TransferStore {
   username: string | null;
   wsConnected: boolean;
   wsClient: WebSocket | null;
+  loginSuccessToast: boolean;
 
   // Actions
   loadTasks: () => Promise<void>;
   cancelTask: (uploadId: string) => Promise<void>;
   pauseTask: (uploadId: string) => Promise<void>;
   resumeTask: (uploadId: string) => Promise<void>;
+  pauseAll: () => Promise<void>;
+  resumeAll: () => Promise<void>;
+  cancelAll: () => Promise<void>;
   loadConfig: () => Promise<void>;
   checkAuth: () => Promise<void>;
   connectWs: () => void;
@@ -69,6 +73,7 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
   username: null,
   wsConnected: false,
   wsClient: null,
+  loginSuccessToast: false,
 
   loadTasks: async () => {
     try {
@@ -104,6 +109,40 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
     } catch (err) {
       console.error("Failed to resume task:", err);
     }
+  },
+
+  pauseAll: async () => {
+    const { tasks } = get();
+    const targets = tasks.filter(
+      (t) => t.status === "running" || t.status === "pending"
+    );
+    await Promise.allSettled(
+      targets.map((t) => invoke<boolean>("pause_task", { uploadId: t.upload_id }))
+    );
+    await get().loadTasks();
+  },
+
+  resumeAll: async () => {
+    const { tasks } = get();
+    const targets = tasks.filter((t) => t.status === "paused");
+    await Promise.allSettled(
+      targets.map((t) => invoke<boolean>("resume_task", { uploadId: t.upload_id }))
+    );
+    await get().loadTasks();
+  },
+
+  cancelAll: async () => {
+    const { tasks } = get();
+    const targets = tasks.filter(
+      (t) =>
+        t.status === "running" ||
+        t.status === "pending" ||
+        t.status === "paused"
+    );
+    await Promise.allSettled(
+      targets.map((t) => invoke<boolean>("cancel_task", { uploadId: t.upload_id }))
+    );
+    await get().loadTasks();
   },
 
   loadConfig: async () => {
@@ -254,12 +293,14 @@ export async function setupTauriListeners(store: ReturnType<typeof useTransferSt
 
   // 收到 token 直接设置登录态，无需再 invoke keyring
   await listen<string>("auth:token-saved", () => {
-    useTransferStore.setState({ isLoggedIn: true });
+    useTransferStore.setState({ isLoggedIn: true, loginSuccessToast: true });
     // 刷新用户名
     invoke<string | null>("get_current_username").then(username => {
       useTransferStore.setState({ username });
     });
     setTimeout(() => store.loadTasks(), 300);
+    // 3秒后自动隐藏提示
+    setTimeout(() => useTransferStore.setState({ loginSuccessToast: false }), 3000);
   });
 
   // 用户切换后任务列表已重载，前端同步刷新

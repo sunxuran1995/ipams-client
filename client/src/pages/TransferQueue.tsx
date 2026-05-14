@@ -10,10 +10,14 @@ export const TransferQueue: React.FC = () => {
     isLoggedIn,
     username,
     wsConnected,
+    loginSuccessToast,
     loadTasks,
     cancelTask,
     pauseTask,
     resumeTask,
+    pauseAll,
+    resumeAll,
+    cancelAll,
     checkAuth,
     connectWs,
     openLoginPage,
@@ -54,6 +58,12 @@ export const TransferQueue: React.FC = () => {
   ).length;
 
   const completedCount = tasks.filter((t) => t.status === "completed").length;
+
+  const pausedCount = tasks.filter((t) => t.status === "paused").length;
+
+  const hasCancellable = tasks.some(
+    (t) => t.status === "running" || t.status === "pending" || t.status === "paused"
+  );
 
   return (
     <div
@@ -211,57 +221,175 @@ export const TransferQueue: React.FC = () => {
         <div
           style={{
             display: "flex",
-            gap: 16,
+            alignItems: "center",
+            gap: 8,
             marginTop: 10,
           }}
         >
-          {[
-            { label: "全部", value: "all", count: tasks.length },
-            { label: "进行中", value: "active", count: activeCount },
-            { label: "已完成", value: "done", count: completedCount },
-          ].map((tab) => (
-            <button
-              key={tab.value}
-              onClick={() => setFilter(tab.value as typeof filter)}
+          {/* Filter tabs */}
+          <div style={{ display: "flex", gap: 8, flex: 1 }}>
+            {[
+              { label: "全部", value: "all", count: tasks.length },
+              { label: "进行中", value: "active", count: activeCount },
+              { label: "已完成", value: "done", count: completedCount },
+            ].map((tab) => (
+              <button
+                key={tab.value}
+                onClick={() => setFilter(tab.value as typeof filter)}
+                style={{
+                  background:
+                    filter === tab.value
+                      ? "rgba(99,102,241,0.2)"
+                      : "transparent",
+                  border:
+                    filter === tab.value
+                      ? "1px solid rgba(99,102,241,0.4)"
+                      : "1px solid transparent",
+                  color: filter === tab.value ? "#6366f1" : "#9ca3af",
+                  borderRadius: 6,
+                  padding: "4px 12px",
+                  fontSize: 12,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                  transition: "all 0.2s",
+                  WebkitAppRegion: "no-drag",
+                }}
+              >
+                {tab.label}
+                {tab.count > 0 && (
+                  <span
+                    style={{
+                      marginLeft: 6,
+                      background:
+                        filter === tab.value
+                          ? "rgba(99,102,241,0.3)"
+                          : "rgba(107,114,128,0.2)",
+                      color: filter === tab.value ? "#a5b4fc" : "#9ca3af",
+                      borderRadius: 10,
+                      padding: "1px 6px",
+                      fontSize: 11,
+                    }}
+                  >
+                    {tab.count}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {/* Bulk action buttons */}
+          {isLoggedIn && (
+            <div
               style={{
-                background:
-                  filter === tab.value
-                    ? "rgba(99,102,241,0.2)"
-                    : "transparent",
-                border:
-                  filter === tab.value
-                    ? "1px solid rgba(99,102,241,0.4)"
-                    : "1px solid transparent",
-                color: filter === tab.value ? "#6366f1" : "#9ca3af",
-                borderRadius: 6,
-                padding: "4px 12px",
-                fontSize: 12,
-                fontWeight: 500,
-                cursor: "pointer",
-                transition: "all 0.2s",
+                display: "flex",
+                gap: 6,
                 WebkitAppRegion: "no-drag",
               }}
             >
-              {tab.label}
-              {tab.count > 0 && (
-                <span
+              {activeCount > 0 && (
+                <button
+                  onClick={pauseAll}
+                  title="全部暂停"
                   style={{
-                    marginLeft: 6,
-                    background:
-                      filter === tab.value
-                        ? "rgba(99,102,241,0.3)"
-                        : "rgba(107,114,128,0.2)",
-                    color: filter === tab.value ? "#a5b4fc" : "#9ca3af",
-                    borderRadius: 10,
-                    padding: "1px 6px",
-                    fontSize: 11,
+                    background: "transparent",
+                    border: "1px solid #374151",
+                    color: "#9ca3af",
+                    borderRadius: 6,
+                    padding: "3px 10px",
+                    fontSize: 12,
+                    cursor: "pointer",
+                    transition: "all 0.2s",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = "#f59e0b";
+                    e.currentTarget.style.color = "#f59e0b";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = "#374151";
+                    e.currentTarget.style.color = "#9ca3af";
                   }}
                 >
-                  {tab.count}
-                </span>
+                  {/* pause icon */}
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="6" y="4" width="4" height="16" rx="1" />
+                    <rect x="14" y="4" width="4" height="16" rx="1" />
+                  </svg>
+                  全部暂停
+                </button>
               )}
-            </button>
-          ))}
+
+              {pausedCount > 0 && (
+                <button
+                  onClick={resumeAll}
+                  title="全部开始"
+                  style={{
+                    background: "transparent",
+                    border: "1px solid #374151",
+                    color: "#9ca3af",
+                    borderRadius: 6,
+                    padding: "3px 10px",
+                    fontSize: 12,
+                    cursor: "pointer",
+                    transition: "all 0.2s",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = "#10b981";
+                    e.currentTarget.style.color = "#10b981";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = "#374151";
+                    e.currentTarget.style.color = "#9ca3af";
+                  }}
+                >
+                  {/* play icon */}
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M8 5v14l11-7z" />
+                  </svg>
+                  全部开始
+                </button>
+              )}
+
+              {hasCancellable && (
+                <button
+                  onClick={cancelAll}
+                  title="全部取消"
+                  style={{
+                    background: "transparent",
+                    border: "1px solid #374151",
+                    color: "#9ca3af",
+                    borderRadius: 6,
+                    padding: "3px 10px",
+                    fontSize: 12,
+                    cursor: "pointer",
+                    transition: "all 0.2s",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = "#ef4444";
+                    e.currentTarget.style.color = "#ef4444";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = "#374151";
+                    e.currentTarget.style.color = "#9ca3af";
+                  }}
+                >
+                  {/* stop icon */}
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="4" y="4" width="16" height="16" rx="2" />
+                  </svg>
+                  全部取消
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -376,6 +504,35 @@ export const TransferQueue: React.FC = () => {
         <span>IPAMS 传输客户端 v0.1.0</span>
         <span>ws://127.0.0.1:17892/ws</span>
       </div>
+
+      {/* 登录成功 Toast */}
+      {loginSuccessToast && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 48,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "linear-gradient(135deg, #065f46, #047857)",
+            border: "1px solid #10b981",
+            color: "#d1fae5",
+            borderRadius: 10,
+            padding: "10px 20px",
+            fontSize: 13,
+            fontWeight: 600,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            boxShadow: "0 4px 20px rgba(16,185,129,0.3)",
+            zIndex: 100,
+            whiteSpace: "nowrap",
+            animation: "fadeInUp 0.3s ease",
+          }}
+        >
+          <span style={{ fontSize: 16 }}>✓</span>
+          登录成功{username ? `，欢迎 ${username}` : ""}
+        </div>
+      )}
     </div>
   );
 };
