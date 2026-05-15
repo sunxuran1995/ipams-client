@@ -3,8 +3,11 @@ name: Build Client
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -13,9 +16,9 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            args: "--target aarch64-apple-darwin"
+            args: '--target aarch64-apple-darwin'
           - platform: macos-latest
-            args: "--target x86_64-apple-darwin"
+            args: '--target x86_64-apple-darwin'
 
     runs-on: ${{ matrix.platform }}
 
@@ -25,8 +28,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4.4.0
         with:
-          node-version: "22"
-          cache: "npm"
+          node-version: '22'
+          cache: 'npm'
           cache-dependency-path: client/package-lock.json
 
       - name: Install Rust
@@ -37,7 +40,7 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: "./client/src-tauri -> target"
+          workspaces: './client/src-tauri -> target'
 
       - name: Install frontend dependencies
         working-directory: client
