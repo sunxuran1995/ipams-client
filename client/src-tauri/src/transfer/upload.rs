@@ -26,6 +26,7 @@ impl Uploader {
         let cfg = config::get_config();
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(30))
             .build()
             .context("Failed to build HTTP client")?;
 
@@ -292,7 +293,17 @@ impl Uploader {
                 // 用 select! 监听取消，HTTP 请求可以被中断
                 let response = tokio::select! {
                     r = client.put(&url).bearer_auth(&token).multipart(form).send() => {
-                        r.map_err(|e| anyhow!("Failed to upload chunk {}: {:#}", chunk_index, e))?
+                        r.map_err(|e| {
+                            // Log detailed error info to help diagnose Mac TLS/network issues
+                            tracing::error!(
+                                "Chunk {} network error: {:#}\n  is_connect={} is_timeout={} is_request={}",
+                                chunk_index, e,
+                                e.is_connect(),
+                                e.is_timeout(),
+                                e.is_request(),
+                            );
+                            anyhow!("Failed to upload chunk {}: {:#}", chunk_index, e)
+                        })?
                     }
                     _ = cancel.cancelled() => {
                         tracing::info!("Chunk {} cancelled", chunk_index);
