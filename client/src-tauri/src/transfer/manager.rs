@@ -33,6 +33,12 @@ static GLOBAL_CANCELLED: std::sync::atomic::AtomicBool =
 static GLOBAL_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 全局文件级并发信号量：限制同时上传的文件数，避免大量并发连接耗尽系统资源
+/// 每个文件上传占用一个 permit，上传完成（成功/失败/暂停）后释放
+const MAX_CONCURRENT_FILES: usize = 3;
+static FILE_UPLOAD_SEMAPHORE: Lazy<Arc<tokio::sync::Semaphore>> =
+    Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILES)));
+
 pub fn is_paused(upload_id: &str) -> bool {
     PAUSED_SET.try_read().map(|s| s.contains(upload_id)).unwrap_or(false)
 }
@@ -482,7 +488,13 @@ pub async fn resume_task(upload_id: &str) -> bool {
             let task_clone = task.clone();
             // 在 spawn 之前读好 token，避免异步上下文里 keyring 读取失败
             let token = crate::auth::load_token();
+            let file_sem = FILE_UPLOAD_SEMAPHORE.clone();
             tokio::spawn(async move {
+                // 等待获取 permit，与 enqueue_upload_by_params 共享同一个信号量
+                let _permit = match file_sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
                 let cfg = crate::config::get_config();
 
                 // 检查后端 upload_task 状态，如果是 aborted/failed/completed 则需要重新 init
@@ -998,10 +1010,19 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
             }));
             continue;
         }
+        // 使用全局文件级信号量，限制同时上传的文件数
+        // 避免大量文件并发时（N 文件 × M 分片）耗尽 TCP 连接资源导致 "error sending request"
+        let file_sem = FILE_UPLOAD_SEMAPHORE.clone();
         tokio::spawn(async move {
+            // 等待获取 permit，排队而不是直接失败
+            let _permit = match file_sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return, // semaphore closed，不应发生
+            };
             if let Err(e) = start_upload(upload_id_owned, file_path, detail, token_clone).await {
                 tracing::error!("Upload failed: {}", e);
             }
+            // _permit 在此处 drop，自动释放信号量，允许下一个文件开始上传
         });
     }
 
@@ -1026,6 +1047,15 @@ fn scan_folder_recursive(folder_path: &std::path::Path) -> Result<Vec<(std::path
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+
+            // Skip hidden files and directories (names starting with '.')
+            let entry_name = entry.file_name();
+            let name_str = entry_name.to_string_lossy();
+            if name_str.starts_with('.') {
+                tracing::debug!("Skipping hidden entry: {:?}", path);
+                continue;
+            }
+
             if path.is_dir() {
                 visit_dir(&path, base, folder_name, files)?;
             } else if path.is_file() {
