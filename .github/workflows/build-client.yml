@@ -3,7 +3,7 @@ name: Build Client
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
 
 jobs:
@@ -13,20 +13,20 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
+            args: "--target aarch64-apple-darwin"
           - platform: macos-latest
-            args: '--target x86_64-apple-darwin'
+            args: "--target x86_64-apple-darwin"
 
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.4.0
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: "22"
+          cache: "npm"
           cache-dependency-path: client/package-lock.json
 
       - name: Install Rust
@@ -37,15 +37,15 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: './client/src-tauri -> target'
+          workspaces: "./client/src-tauri -> target"
 
       - name: Install frontend dependencies
         working-directory: client
         run: npm install
 
-      - name: Fix tauri binary permissions
+      - name: Fix binary permissions
         working-directory: client
-        run: chmod +x node_modules/.bin/tauri
+        run: chmod -R +x node_modules/.bin/
 
       - name: Build Tauri app
         working-directory: client
@@ -53,7 +53,7 @@ jobs:
 
       - name: Upload macOS artifacts
         if: matrix.platform == 'macos-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: macos-${{ matrix.args == '--target aarch64-apple-darwin' && 'arm64' || 'x64' }}
           path: |
@@ -62,14 +62,14 @@ jobs:
 
       - name: Upload Windows artifacts
         if: matrix.platform == 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: windows-x64
           path: client/src-tauri/target/release/bundle/msi/*.msi
 
       - name: Upload Linux artifacts
         if: matrix.platform == 'ubuntu-22.04'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: linux-x64
           path: client/src-tauri/target/release/bundle/deb/*.deb
