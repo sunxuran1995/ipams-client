@@ -109,12 +109,19 @@ impl Uploader {
             self.api_url, self.upload_id, chunk_index
         );
 
+        let form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(data.to_vec())
+                .file_name("chunk")
+                .mime_str("application/octet-stream")
+                .unwrap(),
+        );
+
         let response = self
             .client
             .put(&url)
             .bearer_auth(&self.token)
-            .header("Content-Type", "application/octet-stream")
-            .body(data)
+            .multipart(form)
             .send()
             .await
             .with_context(|| format!("Failed to upload chunk {}", chunk_index))?;
@@ -235,6 +242,8 @@ impl Uploader {
         let already_uploaded = task.total_chunks - chunks_to_upload.len() as u32;
         let uploaded_count = Arc::new(std::sync::atomic::AtomicU32::new(already_uploaded));
         let upload_id_ref = self.upload_id.clone();
+        // 复用同一个 HTTP client，避免每个 chunk 都重新建立 TLS 连接
+        let shared_client = Arc::new(self.client.clone());
 
         for chunk_index in chunks_to_upload {
             // 检查是否被暂停/取消
@@ -261,17 +270,15 @@ impl Uploader {
             let on_progress = on_progress.clone();
             let uploaded_count = uploaded_count.clone();
             let cancel = cancel_token.clone();
+            let client = shared_client.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
 
                 // chunk_index 是 1-based，文件偏移量需减 1
                 let offset = (chunk_index - 1) as u64 * chunk_size as u64;
-                let data = read_chunk(&file_path, offset, chunk_size).await?;
-
-                let client = Client::builder()
-                    .timeout(std::time::Duration::from_secs(120))
-                    .build()?;
+                let data = read_chunk(&file_path, offset, chunk_size).await
+                    .map_err(|e| anyhow!("Failed to read chunk {} from file: {:#}", chunk_index, e))?;
 
                 let url = format!("{}/api/v1/upload/{}/chunk/{}", api_url, upload_id, chunk_index);
                 let form = reqwest::multipart::Form::new().part(
@@ -285,7 +292,7 @@ impl Uploader {
                 // 用 select! 监听取消，HTTP 请求可以被中断
                 let response = tokio::select! {
                     r = client.put(&url).bearer_auth(&token).multipart(form).send() => {
-                        r.with_context(|| format!("Failed to upload chunk {}", chunk_index))?
+                        r.map_err(|e| anyhow!("Failed to upload chunk {}: {:#}", chunk_index, e))?
                     }
                     _ = cancel.cancelled() => {
                         tracing::info!("Chunk {} cancelled", chunk_index);
@@ -296,7 +303,7 @@ impl Uploader {
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    return Err(anyhow!("Chunk {} upload failed {}: {}", chunk_index, status, body));
+                    return Err(anyhow!("Failed to upload chunk {}: HTTP {} - {}", chunk_index, status, body));
                 }
 
                 let done = uploaded_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -378,27 +385,18 @@ async fn read_chunk(file_path: &PathBuf, offset: u64, size: usize) -> Result<Byt
         .await
         .context("Failed to seek in file")?;
 
-    // read_exact guarantees the buffer is fully filled (or errors at EOF).
-    // For the last chunk the file may be shorter than `size`, so we fall back
-    // to a read_to_end-style loop when read_exact hits an unexpected EOF.
-    let mut buf = vec![0u8; size];
-    match file.read_exact(&mut buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            // Last chunk: re-open and read however many bytes are actually there.
-            let mut file2 = File::open(file_path)
-                .await
-                .with_context(|| format!("Failed to re-open file: {:?}", file_path))?;
-            file2.seek(std::io::SeekFrom::Start(offset))
-                .await
-                .context("Failed to seek in file (last chunk)")?;
-            buf.clear();
-            file2
-                .read_to_end(&mut buf)
-                .await
-                .context("Failed to read last chunk from file")?;
-        }
-        Err(e) => return Err(e).context("Failed to read chunk from file"),
+    // Use a limited read instead of read_exact to gracefully handle the last
+    // chunk which may be smaller than `size`. read_exact would return
+    // UnexpectedEof and previously triggered a second File::open that could
+    // fail on network volumes or paths with non-ASCII characters on macOS.
+    let mut buf = Vec::with_capacity(size);
+    file.take(size as u64)
+        .read_to_end(&mut buf)
+        .await
+        .with_context(|| format!("Failed to read chunk from file: {:?}", file_path))?;
+
+    if buf.is_empty() {
+        return Err(anyhow!("Read 0 bytes at offset {} from file: {:?}", offset, file_path));
     }
 
     Ok(Bytes::from(buf))
