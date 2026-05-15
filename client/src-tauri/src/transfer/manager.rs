@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use sha2::{Sha256, Digest};
 
 static TASK_STORE: Lazy<Arc<RwLock<HashMap<String, TransferTask>>>> =
     Lazy::new(|| Arc::new(RwLock::new(load_tasks_from_disk())));
@@ -21,6 +22,16 @@ static CANCEL_TOKENS: Lazy<Arc<RwLock<HashMap<String, CancellationToken>>>> =
 /// 被暂停的 upload_id 集合（用于循环前的快速检查）
 static PAUSED_SET: Lazy<Arc<RwLock<HashSet<String>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashSet::new())));
+
+/// 全局取消标志：cancel_all 后设为 true，阻止新任务自动启动
+/// 用户主动发起新上传时重置为 false
+static GLOBAL_CANCELLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 全局暂停标志：pause_all 后设为 true，阻止新任务自动启动
+/// resume_all 或用户主动发起新上传时重置为 false
+static GLOBAL_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub fn is_paused(upload_id: &str) -> bool {
     PAUSED_SET.try_read().map(|s| s.contains(upload_id)).unwrap_or(false)
@@ -93,6 +104,31 @@ fn now_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// 计算文件的 SHA-256 哈希（取前 16 字节，hex 编码），与前端 computeFileHash 保持一致。
+/// 文件较大时分块读取，避免一次性占用大量内存。
+async fn compute_file_hash(file_path: &PathBuf) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(file_path)
+        .await
+        .with_context(|| format!("Cannot open file for hashing: {:?}", file_path))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB 读取缓冲
+    loop {
+        let n = file.read(&mut buf).await.context("Read error during hashing")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let result = hasher.finalize();
+    // 取前 16 字节，与前端保持一致
+    let hex: String = result[..16]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    Ok(hex)
 }
 
 pub async fn get_all_tasks() -> Vec<TransferTask> {
@@ -170,6 +206,8 @@ pub async fn enqueue_upload<R: Runtime>(app: &AppHandle<R>, upload_id: &str, tok
         file_path: None,
         chunk_size: Some(detail.chunk_size),
         user_id: Some(current_user_id()),
+        project_id: detail.project_id.clone(),
+        folder_id: detail.folder_id.clone(),
     };
     upsert_task(task).await;
 
@@ -245,6 +283,30 @@ async fn start_upload(
     detail: UploadTaskDetail,
     token: Option<String>,
 ) -> Result<()> {
+    // 全局取消标志检查：cancel_all 后不启动新上传
+    if GLOBAL_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::info!("Global cancel active, aborting start_upload for {}", upload_id);
+        update_task_status(&upload_id, TaskStatus::Cancelled, Some("已取消".to_string())).await;
+        ws_server::broadcast_message(json!({
+            "type": "task_cancelled",
+            "upload_id": upload_id,
+        }));
+        return Ok(());
+    }
+
+    // 全局暂停标志检查：pause_all 后不启动新上传，改为暂停状态等待恢复
+    if GLOBAL_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::info!("Global pause active, suspending start_upload for {}", upload_id);
+        update_task_status(&upload_id, TaskStatus::Paused, None).await;
+        PAUSED_SET.write().await.insert(upload_id.clone());
+        ws_server::broadcast_message(json!({
+            "type": "task_status",
+            "upload_id": upload_id,
+            "status": "paused",
+        }));
+        return Ok(());
+    }
+
     update_task_status(&upload_id, TaskStatus::Running, None).await;
 
     // 注册 cancellation token
@@ -449,6 +511,8 @@ pub async fn resume_task(upload_id: &str) -> bool {
                     uploaded_chunks: vec![],
                     oss_path: String::new(),
                     oss_upload_id: None,
+                    project_id: task_clone.project_id.clone(),
+                    folder_id: task_clone.folder_id.clone(),
                 };
                 if let Err(e) = start_upload(effective_upload_id.clone(), file_path, detail, token).await {
                     tracing::error!("Resume upload failed: {}", e);
@@ -507,37 +571,45 @@ async fn check_and_reinit_upload(
 
     tracing::info!("Reinitializing upload for task {} (file: {})", upload_id, task.filename);
 
-    // 从旧 upload_task 的 progress 接口拿 asset_id，再查 asset 获取 project_id / folder_id
-    let progress_url = format!("{}/api/v1/upload/{}/progress", cfg.api_url, upload_id);
-    let (project_id, folder_id) = match client.get(&progress_url).bearer_auth(token).send().await {
-        Ok(r) if r.status().is_success() => {
-            let body: serde_json::Value = r.json().await.unwrap_or_default();
-            let asset_id = body["data"]["asset_id"].as_str().unwrap_or("").to_string();
-            if asset_id.is_empty() {
-                (None, None)
-            } else {
-                let asset_url = format!("{}/api/v1/assets/{}", cfg.api_url, asset_id);
-                match client.get(&asset_url).bearer_auth(token).send().await {
-                    Ok(ar) if ar.status().is_success() => {
-                        let av: serde_json::Value = ar.json().await.unwrap_or_default();
-                        let pid = av["data"]["project_id"].as_str().map(|s| s.to_string());
-                        let fid = av["data"]["folder_id"].as_str().map(|s| s.to_string());
-                        (pid, fid)
+    // 优先使用本地 task 中保存的 project_id / folder_id，避免依赖后端查询
+    // 如果本地没有（旧版持久化任务），则回退到查询后端 client task detail 接口
+    let (project_id, folder_id) = match task.project_id.clone() {
+        Some(p) => (p, task.folder_id.clone()),
+        None => {
+            tracing::info!("task {} has no local project_id, fetching from backend...", upload_id);
+            let detail_url = format!("{}/api/v1/client/tasks/upload/{}", cfg.api_url, upload_id);
+            match client.get(&detail_url).bearer_auth(token).send().await {
+                Ok(r) if r.status().is_success() => {
+                    let body: serde_json::Value = r.json().await.unwrap_or_default();
+                    match body["data"]["project_id"].as_str() {
+                        Some(pid) => {
+                            let fid = body["data"]["folder_id"].as_str().map(|s| s.to_string());
+                            tracing::info!("Fetched project_id={} for task {}", pid, upload_id);
+                            (pid.to_string(), fid)
+                        }
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "Cannot reinit upload: unable to determine project_id for task {}",
+                                upload_id
+                            ));
+                        }
                     }
-                    _ => (None, None),
+                }
+                Ok(r) => {
+                    return Err(anyhow::anyhow!(
+                        "Cannot reinit upload: backend returned {} when fetching task detail for {}",
+                        r.status(),
+                        upload_id
+                    ));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Cannot reinit upload: failed to fetch task detail for {}: {}",
+                        upload_id,
+                        e
+                    ));
                 }
             }
-        }
-        _ => (None, None),
-    };
-
-    let project_id = match project_id {
-        Some(p) => p,
-        None => {
-            return Err(anyhow::anyhow!(
-                "Cannot reinit upload: unable to determine project_id for task {}",
-                upload_id
-            ));
         }
     };
 
@@ -685,6 +757,10 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
 
     tracing::info!("Total files to upload: {}", files_to_upload.len());
 
+    // 用户主动发起新上传，清除全局取消标志
+    // 注意：不在此处清除 GLOBAL_PAUSED，全局暂停必须由用户显式点击"全部恢复"来解除
+    GLOBAL_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
+
     // Get API token
     let api_token = match token.clone().or_else(|| crate::auth::load_token()) {
         Some(t) => t,
@@ -735,7 +811,24 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
             folder_id.clone()
         };
 
-        // Call /upload/init
+        // ── 计算文件哈希（秒传 / 断点续传用）────────────────────────────────
+        ws_server::broadcast_message(json!({
+            "type": "upload_hashing",
+            "filename": filename,
+            "file_size": file_size,
+        }));
+        let md5_checksum = match compute_file_hash(&file_path).await {
+            Ok(h) => {
+                tracing::info!("File hash for {}: {}", filename, h);
+                Some(h)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to compute hash for {}: {}, proceeding without dedup", filename, e);
+                None
+            }
+        };
+
+        // ── 调用 /upload/init ─────────────────────────────────────────────
         let init_url = format!("{}/api/v1/upload/init", cfg.api_url);
         let body = serde_json::json!({
             "filename": filename,
@@ -743,6 +836,7 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
             "project_id": project_id,
             "folder_id": target_folder_id,
             "asset_type_id": asset_type_id,
+            "md5_checksum": md5_checksum,
         });
 
         let resp = client
@@ -775,6 +869,53 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
             }
         };
 
+        // ── 秒传：服务端检测到相同文件，直接完成 ─────────────────────────
+        let is_instant = wrapper["data"]["is_instant_upload"].as_bool().unwrap_or(false)
+            || wrapper["data"]["is_duplicate"].as_bool().unwrap_or(false);
+
+        if is_instant {
+            let asset_id = wrapper["data"]["asset_id"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            tracing::info!("Instant upload (秒传) for {}: asset_id={}", filename, asset_id);
+
+            // 记录一条已完成的任务，方便前端展示
+            let instant_upload_id = format!("instant-{}-{}", now_ts(), filename);
+            let task = TransferTask {
+                upload_id: instant_upload_id.clone(),
+                filename: filename.clone(),
+                file_size,
+                total_chunks: 1,
+                uploaded_chunks: 1,
+                status: TaskStatus::Completed,
+                error: None,
+                created_at: now_ts(),
+                file_path: Some(file_path.to_string_lossy().to_string()),
+                chunk_size: None,
+                user_id: Some(current_user_id()),
+                project_id: Some(project_id.clone()),
+                folder_id: target_folder_id.clone(),
+            };
+            upsert_task(task).await;
+
+            // 通知前端
+            let _ = app.emit("upload:instant", serde_json::json!({
+                "filename": filename,
+                "file_size": file_size,
+                "asset_id": asset_id,
+            }));
+            ws_server::broadcast_message(json!({
+                "type": "upload_instant",
+                "upload_id": instant_upload_id,
+                "filename": filename,
+                "file_size": file_size,
+                "asset_id": asset_id,
+            }));
+            continue; // 跳过分片上传
+        }
+
+        // ── 普通分片上传 ──────────────────────────────────────────────────
         let upload_id = match wrapper["data"]["upload_id"].as_str() {
             Some(id) => id.to_string(),
             None => {
@@ -797,6 +938,8 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
             uploaded_chunks: vec![],
             oss_path: String::new(),
             oss_upload_id: None,
+            project_id: Some(project_id.clone()),
+            folder_id: target_folder_id.clone(),
         };
 
         let task = TransferTask {
@@ -811,6 +954,8 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
             file_path: Some(file_path.to_string_lossy().to_string()),
             chunk_size: Some(chunk_size as u64),
             user_id: Some(current_user_id()),
+            project_id: Some(project_id.clone()),
+            folder_id: target_folder_id.clone(),
         };
         upsert_task(task).await;
 
@@ -831,6 +976,28 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
 
         let upload_id_owned = upload_id.clone();
         let token_clone = Some(api_token.clone());
+        // 如果在处理文件列表期间用户触发了 cancel_all，跳过后续文件
+        if GLOBAL_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!("Global cancel active, skipping upload for {}", upload_id_owned);
+            update_task_status(&upload_id_owned, TaskStatus::Cancelled, Some("已取消".to_string())).await;
+            ws_server::broadcast_message(json!({
+                "type": "task_cancelled",
+                "upload_id": upload_id_owned,
+            }));
+            continue;
+        }
+        // 如果在处理文件列表期间用户触发了 pause_all，将任务以暂停状态入库，等待用户恢复
+        if GLOBAL_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!("Global pause active, queuing {} as paused", upload_id_owned);
+            update_task_status(&upload_id_owned, TaskStatus::Paused, None).await;
+            PAUSED_SET.write().await.insert(upload_id_owned.clone());
+            ws_server::broadcast_message(json!({
+                "type": "task_status",
+                "upload_id": upload_id_owned,
+                "status": "paused",
+            }));
+            continue;
+        }
         tokio::spawn(async move {
             if let Err(e) = start_upload(upload_id_owned, file_path, detail, token_clone).await {
                 tracing::error!("Upload failed: {}", e);
@@ -993,6 +1160,8 @@ pub async fn resume_pending_tasks(_token: Option<String>) {
                 uploaded_chunks: vec![],
                 oss_path: String::new(),
                 oss_upload_id: None,
+                project_id: task.project_id.clone(),
+                folder_id: task.folder_id.clone(),
             };
             if let Err(e) = start_upload(upload_id.clone(), file_path, detail, token).await {
                 tracing::error!("Resume: upload failed for {}: {}", upload_id, e);
@@ -1003,6 +1172,9 @@ pub async fn resume_pending_tasks(_token: Option<String>) {
 
 /// 暂停所有正在运行或等待中的任务
 pub async fn pause_all_tasks() {
+    // 设置全局暂停标志，阻止 enqueue_upload_by_params 中后续文件自动启动
+    GLOBAL_PAUSED.store(true, std::sync::atomic::Ordering::SeqCst);
+
     let upload_ids: Vec<String> = {
         let store = TASK_STORE.read().await;
         store
@@ -1018,6 +1190,9 @@ pub async fn pause_all_tasks() {
 
 /// 恢复所有已暂停的任务
 pub async fn resume_all_tasks() {
+    // 清除全局暂停标志
+    GLOBAL_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
+
     let upload_ids: Vec<String> = {
         let store = TASK_STORE.read().await;
         store
@@ -1033,6 +1208,9 @@ pub async fn resume_all_tasks() {
 
 /// 取消所有活跃任务
 pub async fn cancel_all_tasks() {
+    // 设置全局取消标志，阻止 enqueue_upload_by_params 中后续文件自动启动
+    GLOBAL_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
+
     let upload_ids: Vec<String> = {
         let store = TASK_STORE.read().await;
         store

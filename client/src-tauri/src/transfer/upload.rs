@@ -7,7 +7,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncSeekExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -203,9 +203,6 @@ impl Uploader {
             existing_progress.uploaded_chunks.len()
         );
 
-        let uploaded_set: std::collections::HashSet<u32> =
-            existing_progress.uploaded_chunks.iter().cloned().collect();
-
         tracing::info!(
             "Upload {}: uploaded_set = {:?}",
             self.upload_id,
@@ -341,6 +338,21 @@ impl Uploader {
             return Err(anyhow!("Upload errors: {}", errors.join("; ")));
         }
 
+        // Verify all chunks are recorded before completing
+        // This guards against silent failures where a chunk returned 200
+        // but the etag was not persisted (e.g. DB update matched 0 rows).
+        let progress = self.fetch_upload_progress().await.unwrap_or_default();
+        let recorded: std::collections::HashSet<u32> = progress.uploaded_chunks.into_iter().collect();
+        let missing: Vec<u32> = (1..=task.total_chunks)
+            .filter(|c| !recorded.contains(c))
+            .collect();
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "Chunks not recorded on server after upload: {:?}. Please retry.",
+                missing
+            ));
+        }
+
         // Complete upload
         self.complete_upload().await?;
 
@@ -356,6 +368,8 @@ impl Uploader {
 }
 
 async fn read_chunk(file_path: &PathBuf, offset: u64, size: usize) -> Result<Bytes> {
+    use tokio::io::AsyncReadExt;
+
     let mut file = File::open(file_path)
         .await
         .with_context(|| format!("Failed to open file: {:?}", file_path))?;
@@ -364,12 +378,28 @@ async fn read_chunk(file_path: &PathBuf, offset: u64, size: usize) -> Result<Byt
         .await
         .context("Failed to seek in file")?;
 
+    // read_exact guarantees the buffer is fully filled (or errors at EOF).
+    // For the last chunk the file may be shorter than `size`, so we fall back
+    // to a read_to_end-style loop when read_exact hits an unexpected EOF.
     let mut buf = vec![0u8; size];
-    let n = file
-        .read(&mut buf)
-        .await
-        .context("Failed to read chunk from file")?;
-    buf.truncate(n);
+    match file.read_exact(&mut buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            // Last chunk: re-open and read however many bytes are actually there.
+            let mut file2 = File::open(file_path)
+                .await
+                .with_context(|| format!("Failed to re-open file: {:?}", file_path))?;
+            file2.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .context("Failed to seek in file (last chunk)")?;
+            buf.clear();
+            file2
+                .read_to_end(&mut buf)
+                .await
+                .context("Failed to read last chunk from file")?;
+        }
+        Err(e) => return Err(e).context("Failed to read chunk from file"),
+    }
 
     Ok(Bytes::from(buf))
 }

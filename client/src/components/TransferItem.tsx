@@ -55,6 +55,7 @@ export const TransferItem: React.FC<Props> = ({ task, onCancel, onPause, onResum
   const canCancel = task.status === "pending" || task.status === "running" || task.status === "paused";
   const canPause = task.status === "running" || task.status === "pending";
   const canResume = task.status === "paused";
+  const canRetry = task.status === "failed";
 
   return (
     <div
@@ -154,6 +155,26 @@ export const TransferItem: React.FC<Props> = ({ task, onCancel, onPause, onResum
               onMouseLeave={(e) => { e.currentTarget.style.borderColor = "#374151"; e.currentTarget.style.color = "#9ca3af"; }}
             >
               继续
+            </button>
+          )}
+
+          {canRetry && (
+            <button
+              onClick={() => onResume(task.upload_id)}
+              style={{
+                background: "transparent",
+                border: "1px solid #374151",
+                color: "#9ca3af",
+                borderRadius: 6,
+                padding: "3px 10px",
+                fontSize: 12,
+                cursor: "pointer",
+                transition: "all 0.2s",
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.borderColor = "#f59e0b"; e.currentTarget.style.color = "#f59e0b"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.borderColor = "#374151"; e.currentTarget.style.color = "#9ca3af"; }}
+            >
+              重试
             </button>
           )}
 

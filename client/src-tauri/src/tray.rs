@@ -21,8 +21,12 @@ pub fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 toggle_window(app);
             }
             "quit" => {
-                tracing::info!("Quit requested from tray");
-                app.exit(0);
+                tracing::info!("Quit requested from tray, pausing uploads before exit");
+                let app_clone = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::transfer::manager::pause_all_tasks().await;
+                    app_clone.exit(0);
+                });
             }
             _ => {}
         })

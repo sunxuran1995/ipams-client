@@ -18,13 +18,14 @@ export const TransferQueue: React.FC = () => {
     pauseAll,
     resumeAll,
     cancelAll,
+    retryAll,
     checkAuth,
     connectWs,
     openLoginPage,
     logout,
   } = useTransferStore();
 
-  const [filter, setFilter] = useState<"all" | "active" | "done">("all");
+  const [filter, setFilter] = useState<"all" | "active" | "done" | "failed" | "cancelled">("all");
 
   useEffect(() => {
     checkAuth();
@@ -43,21 +44,25 @@ export const TransferQueue: React.FC = () => {
 
   const filteredTasks = tasks.filter((t) => {
     if (filter === "active")
-      return t.status === "pending" || t.status === "running";
+      return t.status === "pending" || t.status === "running" || t.status === "paused";
     if (filter === "done")
-      return (
-        t.status === "completed" ||
-        t.status === "failed" ||
-        t.status === "cancelled"
-      );
+      return t.status === "completed";
+    if (filter === "failed")
+      return t.status === "failed";
+    if (filter === "cancelled")
+      return t.status === "cancelled";
     return true;
   });
 
   const activeCount = tasks.filter(
-    (t) => t.status === "pending" || t.status === "running"
+    (t) => t.status === "pending" || t.status === "running" || t.status === "paused"
   ).length;
 
   const completedCount = tasks.filter((t) => t.status === "completed").length;
+
+  const failedCount = tasks.filter((t) => t.status === "failed").length;
+
+  const cancelledCount = tasks.filter((t) => t.status === "cancelled").length;
 
   const pausedCount = tasks.filter((t) => t.status === "paused").length;
 
@@ -232,6 +237,8 @@ export const TransferQueue: React.FC = () => {
               { label: "全部", value: "all", count: tasks.length },
               { label: "进行中", value: "active", count: activeCount },
               { label: "已完成", value: "done", count: completedCount },
+              { label: "失败", value: "failed", count: failedCount, isError: true },
+              { label: "已取消", value: "cancelled", count: cancelledCount, isMuted: true },
             ].map((tab) => (
               <button
                 key={tab.value}
@@ -239,13 +246,32 @@ export const TransferQueue: React.FC = () => {
                 style={{
                   background:
                     filter === tab.value
-                      ? "rgba(99,102,241,0.2)"
+                      ? tab.isError
+                        ? "rgba(239,68,68,0.15)"
+                        : tab.isMuted
+                        ? "rgba(107,114,128,0.15)"
+                        : "rgba(99,102,241,0.2)"
                       : "transparent",
                   border:
                     filter === tab.value
-                      ? "1px solid rgba(99,102,241,0.4)"
+                      ? tab.isError
+                        ? "1px solid rgba(239,68,68,0.4)"
+                        : tab.isMuted
+                        ? "1px solid rgba(107,114,128,0.4)"
+                        : "1px solid rgba(99,102,241,0.4)"
+                      : tab.isError && tab.count > 0
+                      ? "1px solid rgba(239,68,68,0.25)"
                       : "1px solid transparent",
-                  color: filter === tab.value ? "#6366f1" : "#9ca3af",
+                  color:
+                    filter === tab.value
+                      ? tab.isError
+                        ? "#ef4444"
+                        : tab.isMuted
+                        ? "#9ca3af"
+                        : "#6366f1"
+                      : tab.isError && tab.count > 0
+                      ? "#f87171"
+                      : "#9ca3af",
                   borderRadius: 6,
                   padding: "4px 12px",
                   fontSize: 12,
@@ -262,9 +288,24 @@ export const TransferQueue: React.FC = () => {
                       marginLeft: 6,
                       background:
                         filter === tab.value
-                          ? "rgba(99,102,241,0.3)"
+                          ? tab.isError
+                            ? "rgba(239,68,68,0.25)"
+                            : tab.isMuted
+                            ? "rgba(107,114,128,0.25)"
+                            : "rgba(99,102,241,0.3)"
+                          : tab.isError
+                          ? "rgba(239,68,68,0.15)"
                           : "rgba(107,114,128,0.2)",
-                      color: filter === tab.value ? "#a5b4fc" : "#9ca3af",
+                      color:
+                        filter === tab.value
+                          ? tab.isError
+                            ? "#fca5a5"
+                            : tab.isMuted
+                            ? "#d1d5db"
+                            : "#a5b4fc"
+                          : tab.isError
+                          ? "#f87171"
+                          : "#9ca3af",
                       borderRadius: 10,
                       padding: "1px 6px",
                       fontSize: 11,
@@ -388,6 +429,43 @@ export const TransferQueue: React.FC = () => {
                   全部取消
                 </button>
               )}
+
+              {failedCount > 0 && (
+                <button
+                  onClick={retryAll}
+                  title="全部重试"
+                  style={{
+                    background: "transparent",
+                    border: "1px solid rgba(239,68,68,0.35)",
+                    color: "#f87171",
+                    borderRadius: 6,
+                    padding: "3px 10px",
+                    fontSize: 12,
+                    cursor: "pointer",
+                    transition: "all 0.2s",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = "#ef4444";
+                    e.currentTarget.style.color = "#ef4444";
+                    e.currentTarget.style.background = "rgba(239,68,68,0.08)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = "rgba(239,68,68,0.35)";
+                    e.currentTarget.style.color = "#f87171";
+                    e.currentTarget.style.background = "transparent";
+                  }}
+                >
+                  {/* retry icon */}
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M1 4v6h6" />
+                    <path d="M3.51 15a9 9 0 1 0 .49-4.5" />
+                  </svg>
+                  全部重试
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -471,6 +549,10 @@ export const TransferQueue: React.FC = () => {
                 ? "没有进行中的任务"
                 : filter === "done"
                 ? "没有已完成的任务"
+                : filter === "failed"
+                ? "没有失败的任务"
+                : filter === "cancelled"
+                ? "没有已取消的任务"
                 : "传输队列为空"}
             </div>
           </div>

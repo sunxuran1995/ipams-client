@@ -55,6 +55,7 @@ interface TransferStore {
   pauseAll: () => Promise<void>;
   resumeAll: () => Promise<void>;
   cancelAll: () => Promise<void>;
+  retryAll: () => Promise<void>;
   loadConfig: () => Promise<void>;
   checkAuth: () => Promise<void>;
   connectWs: () => void;
@@ -112,35 +113,25 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
   },
 
   pauseAll: async () => {
-    const { tasks } = get();
-    const targets = tasks.filter(
-      (t) => t.status === "running" || t.status === "pending"
-    );
-    await Promise.allSettled(
-      targets.map((t) => invoke<boolean>("pause_task", { uploadId: t.upload_id }))
-    );
+    await invoke<void>("pause_all_tasks");
     await get().loadTasks();
   },
 
   resumeAll: async () => {
-    const { tasks } = get();
-    const targets = tasks.filter((t) => t.status === "paused");
-    await Promise.allSettled(
-      targets.map((t) => invoke<boolean>("resume_task", { uploadId: t.upload_id }))
-    );
+    await invoke<void>("resume_all_tasks");
     await get().loadTasks();
   },
 
   cancelAll: async () => {
+    await invoke<void>("cancel_all_tasks");
+    await get().loadTasks();
+  },
+
+  retryAll: async () => {
     const { tasks } = get();
-    const targets = tasks.filter(
-      (t) =>
-        t.status === "running" ||
-        t.status === "pending" ||
-        t.status === "paused"
-    );
+    const targets = tasks.filter((t) => t.status === "failed");
     await Promise.allSettled(
-      targets.map((t) => invoke<boolean>("cancel_task", { uploadId: t.upload_id }))
+      targets.map((t) => invoke<boolean>("resume_task", { uploadId: t.upload_id }))
     );
     await get().loadTasks();
   },

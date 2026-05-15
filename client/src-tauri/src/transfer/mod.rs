@@ -33,6 +33,12 @@ pub struct TransferTask {
     /// 任务所属用户 ID，用于多用户隔离
     #[serde(default)]
     pub user_id: Option<String>,
+    /// 上传目标项目 ID，用于 reinit 时直接使用，无需再查后端
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// 上传目标文件夹 ID
+    #[serde(default)]
+    pub folder_id: Option<String>,
 }
 
 impl TransferTask {
@@ -57,6 +63,10 @@ pub struct UploadTaskDetail {
     pub uploaded_chunks: Vec<u32>,
     pub oss_path: String,
     pub oss_upload_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub folder_id: Option<String>,
 }
 
 /// Response from GET /api/v1/upload/{upload_id}/progress  (data 字段内容)

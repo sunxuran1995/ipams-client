@@ -6,7 +6,7 @@ mod transfer;
 mod ws_server;
 
 use config::AppConfig;
-use tauri::{AppHandle, Emitter, Listener, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use transfer::manager;
 use transfer::TransferTask;
 
@@ -30,6 +30,24 @@ async fn pause_task(upload_id: String) -> Result<bool, String> {
 #[tauri::command]
 async fn resume_task(upload_id: String) -> Result<bool, String> {
     Ok(manager::resume_task(&upload_id).await)
+}
+
+#[tauri::command]
+async fn pause_all_tasks() -> Result<(), String> {
+    manager::pause_all_tasks().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn resume_all_tasks() -> Result<(), String> {
+    manager::resume_all_tasks().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_all_tasks() -> Result<(), String> {
+    manager::cancel_all_tasks().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -243,10 +261,15 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Intercept close → hide to tray instead
+            // Intercept close → pause all tasks, then hide to tray
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                // 隐藏到托盘时暂停所有正在上传的任务
+                tauri::async_runtime::spawn(async move {
+                    tracing::info!("Window hidden, pausing all active uploads");
+                    transfer::manager::pause_all_tasks().await;
+                });
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -254,6 +277,9 @@ pub fn run() {
             cancel_task,
             pause_task,
             resume_task,
+            pause_all_tasks,
+            resume_all_tasks,
+            cancel_all_tasks,
             get_config,
             get_token,
             get_current_username,
