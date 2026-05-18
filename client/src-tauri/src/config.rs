@@ -23,7 +23,7 @@ impl Default for AppConfig {
                 .trim_end_matches('/')
                 .to_string(),
             ws_port: 17892,
-            max_concurrent_chunks: 4,
+            max_concurrent_chunks: 2,
             chunk_size: 5 * 1024 * 1024, // 5MB
         }
     }

@@ -33,6 +33,12 @@ static GLOBAL_CANCELLED: std::sync::atomic::AtomicBool =
 static GLOBAL_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 全局文件级并发信号量：限制同时上传的文件数，避免大量并发连接耗尽系统资源
+/// 每个文件上传占用一个 permit，上传完成（成功/失败/暂停）后释放
+const MAX_CONCURRENT_FILES: usize = 3;
+static FILE_UPLOAD_SEMAPHORE: Lazy<Arc<tokio::sync::Semaphore>> =
+    Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILES)));
+
 pub fn is_paused(upload_id: &str) -> bool {
     PAUSED_SET.try_read().map(|s| s.contains(upload_id)).unwrap_or(false)
 }
@@ -482,7 +488,13 @@ pub async fn resume_task(upload_id: &str) -> bool {
             let task_clone = task.clone();
             // 在 spawn 之前读好 token，避免异步上下文里 keyring 读取失败
             let token = crate::auth::load_token();
+            let file_sem = FILE_UPLOAD_SEMAPHORE.clone();
             tokio::spawn(async move {
+                // 等待获取 permit，与 enqueue_upload_by_params 共享同一个信号量
+                let _permit = match file_sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
                 let cfg = crate::config::get_config();
 
                 // 检查后端 upload_task 状态，如果是 aborted/failed/completed 则需要重新 init
@@ -998,10 +1010,19 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
             }));
             continue;
         }
+        // 使用全局文件级信号量，限制同时上传的文件数
+        // 避免大量文件并发时（N 文件 × M 分片）耗尽 TCP 连接资源导致 "error sending request"
+        let file_sem = FILE_UPLOAD_SEMAPHORE.clone();
         tokio::spawn(async move {
+            // 等待获取 permit，排队而不是直接失败
+            let _permit = match file_sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return, // semaphore closed，不应发生
+            };
             if let Err(e) = start_upload(upload_id_owned, file_path, detail, token_clone).await {
                 tracing::error!("Upload failed: {}", e);
             }
+            // _permit 在此处 drop，自动释放信号量，允许下一个文件开始上传
         });
     }
 
@@ -1026,6 +1047,15 @@ fn scan_folder_recursive(folder_path: &std::path::Path) -> Result<Vec<(std::path
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+
+            // Skip hidden files and directories (names starting with '.')
+            let entry_name = entry.file_name();
+            let name_str = entry_name.to_string_lossy();
+            if name_str.starts_with('.') {
+                tracing::debug!("Skipping hidden entry: {:?}", path);
+                continue;
+            }
+
             if path.is_dir() {
                 visit_dir(&path, base, folder_name, files)?;
             } else if path.is_file() {
@@ -1126,9 +1156,11 @@ async fn create_folder_structure(
 }
 
 /// 启动时恢复未完成的任务（running/pending 且有 file_path 的）
+/// 使用信号量限制同时恢复的任务数，避免大量任务同时启动耗尽资源
 pub async fn resume_pending_tasks(_token: Option<String>) {
     let tasks = get_all_tasks().await;
-    let cfg = crate::config::get_config();
+
+    let mut to_resume: Vec<TransferTask> = Vec::new();
     for task in tasks {
         if task.file_path.is_none() {
             continue;
@@ -1142,16 +1174,56 @@ pub async fn resume_pending_tasks(_token: Option<String>) {
             update_task_status(&task.upload_id, TaskStatus::Failed, Some("文件不存在，无法续传".to_string())).await;
             continue;
         }
+        // 先置为 Paused，后续 check_and_reinit_upload 才能正确处理
+        update_task_status(&task.upload_id, TaskStatus::Paused, None).await;
+        to_resume.push(task);
+    }
 
-        tracing::info!("Resuming upload: {}", task.upload_id);
-        update_task_status(&task.upload_id, TaskStatus::Pending, None).await;
+    tracing::info!("resume_pending_tasks: {} tasks to resume", to_resume.len());
 
-        let upload_id = task.upload_id.clone();
-        let chunk_size = task.chunk_size.unwrap_or(cfg.chunk_size as u64);
-        let token = crate::auth::load_token();
+    if to_resume.is_empty() {
+        return;
+    }
+
+    // 每次最多同时运行 MAX_CONCURRENT_RESUME 个上传，其余排队等待
+    // 避免几百个任务同时启动耗尽系统资源导致 client 卡死
+    const MAX_CONCURRENT_RESUME: usize = 3;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESUME));
+    let cfg = crate::config::get_config();
+
+    for task in to_resume {
+        let sem = semaphore.clone();
+        let cfg = cfg.clone();
         tokio::spawn(async move {
+            // 持有 permit 直到本任务上传完成，保证并发数不超过上限
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+
+            let upload_id = task.upload_id.clone();
+            let file_path = PathBuf::from(task.file_path.as_ref().unwrap());
+            let token = crate::auth::load_token();
+
+            tracing::info!("resume_pending_tasks: starting {}", upload_id);
+
+            // 检查后端状态，必要时重新 init（复用 resume_task 的逻辑）
+            let effective_upload_id = if let Some(ref tok) = token {
+                match check_and_reinit_upload(&upload_id, &task, tok, &cfg).await {
+                    Ok(new_id) => new_id,
+                    Err(e) => {
+                        tracing::error!("resume_pending_tasks: reinit failed for {}: {}", upload_id, e);
+                        update_task_status(&upload_id, TaskStatus::Failed, Some(e.to_string())).await;
+                        return;
+                    }
+                }
+            } else {
+                upload_id.clone()
+            };
+
+            let chunk_size = task.chunk_size.unwrap_or(cfg.chunk_size as u64);
             let detail = crate::transfer::UploadTaskDetail {
-                upload_id: upload_id.clone(),
+                upload_id: effective_upload_id.clone(),
                 asset_id: String::new(),
                 original_filename: task.filename.clone(),
                 file_size: task.file_size,
@@ -1163,8 +1235,11 @@ pub async fn resume_pending_tasks(_token: Option<String>) {
                 project_id: task.project_id.clone(),
                 folder_id: task.folder_id.clone(),
             };
-            if let Err(e) = start_upload(upload_id.clone(), file_path, detail, token).await {
-                tracing::error!("Resume: upload failed for {}: {}", upload_id, e);
+
+            if let Err(e) = start_upload(effective_upload_id.clone(), file_path, detail, token).await {
+                if e.to_string() != "paused" {
+                    tracing::error!("resume_pending_tasks: upload failed for {}: {}", effective_upload_id, e);
+                }
             }
         });
     }
