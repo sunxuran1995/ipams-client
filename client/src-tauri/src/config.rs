@@ -24,7 +24,7 @@ impl Default for AppConfig {
                 .to_string(),
             ws_port: 17892,
             max_concurrent_chunks: 2,
-            chunk_size: 5 * 1024 * 1024, // 5MB
+            chunk_size: 20 * 1024 * 1024, // 20MB
         }
     }
 }

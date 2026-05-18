@@ -659,7 +659,7 @@ async fn check_and_reinit_upload(
         .unwrap_or(task.total_chunks as u64) as u32;
     let new_chunk_size = wrapper["data"]["chunk_size"]
         .as_u64()
-        .unwrap_or(task.chunk_size.unwrap_or(10 * 1024 * 1024));
+        .unwrap_or(task.chunk_size.unwrap_or(20 * 1024 * 1024));
 
     tracing::info!("Reinitialized upload: old={} new={}", upload_id, new_upload_id);
 
@@ -935,7 +935,7 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
                 continue;
             }
         };
-        let chunk_size = wrapper["data"]["chunk_size"].as_u64().unwrap_or(10 * 1024 * 1024) as u32;
+        let chunk_size = wrapper["data"]["chunk_size"].as_u64().unwrap_or(20 * 1024 * 1024) as u32;
         let total_chunks = wrapper["data"]["total_chunks"].as_u64().unwrap_or(1) as u32;
 
         tracing::info!("Initialized upload {} ({} chunks)", upload_id, total_chunks);
