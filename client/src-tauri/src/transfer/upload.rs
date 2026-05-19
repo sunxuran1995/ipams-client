@@ -502,13 +502,17 @@ fn spawn_chunk_upload(
         let done = uploaded_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         on_progress(done, total_chunks);
 
-        ws_server::broadcast_message(json!({
-            "type": "progress",
-            "upload_id": upload_id,
-            "uploaded_chunks": done,
-            "total_chunks": total_chunks,
-            "progress_pct": (done as f32 / total_chunks as f32) * 100.0
-        }));
+        // 节流 WS 广播：只在每 5 个 chunk、第一个 chunk、最后一个 chunk 时广播
+        // 避免大文件上传时每个 chunk 都广播导致前端消息洪泛
+        if done == 1 || done >= total_chunks || done % 5 == 0 {
+            ws_server::broadcast_message(json!({
+                "type": "progress",
+                "upload_id": upload_id,
+                "uploaded_chunks": done,
+                "total_chunks": total_chunks,
+                "progress_pct": (done as f32 / total_chunks as f32) * 100.0
+            }));
+        }
 
         tracing::debug!("Chunk {}/{} uploaded", chunk_index, total_chunks);
         Ok::<(), anyhow::Error>(())

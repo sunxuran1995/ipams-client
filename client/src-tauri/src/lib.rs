@@ -217,6 +217,11 @@ pub fn run() {
                 manager::resume_pending_tasks(resume_token).await;
             });
 
+            // Start periodic task store flush (coalesced writes to tasks.json)
+            tauri::async_runtime::spawn(async move {
+                manager::start_periodic_flush().await;
+            });
+
             // Register deep link handler using the correct Tauri 2 API
             {
                 use tauri_plugin_deep_link::DeepLinkExt;

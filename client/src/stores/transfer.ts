@@ -69,14 +69,184 @@ interface TransferStore {
   _updateTaskFromWs: (msg: WsProgressMessage) => void;
 }
 
-// 防抖 loadTasks：避免短时间内多次 WS 消息触发重复全量刷新
+// ── 防抖 loadTasks：避免短时间内多次 WS 消息触发重复全量刷新 ──────────────
+// 大量文件上传时（60000+），loadTasks 通过 IPC 拉取全部任务列表，
+// 序列化 + 传输 + 反序列化开销巨大，必须严格控制调用频率。
 let _loadTasksTimer: ReturnType<typeof setTimeout> | null = null;
-function _debouncedLoadTasks(get: () => TransferStore) {
+let _loadTasksInFlight = false;
+
+function _debouncedLoadTasks(get: () => TransferStore, delayMs = 500) {
   if (_loadTasksTimer) clearTimeout(_loadTasksTimer);
   _loadTasksTimer = setTimeout(() => {
     _loadTasksTimer = null;
-    get().loadTasks();
-  }, 300);
+    if (!_loadTasksInFlight) {
+      get().loadTasks();
+    }
+  }, delayMs);
+}
+
+// ── WS 消息批量合并：收集一帧内的所有消息，合并后一次性更新 state ──────────
+// 避免每条 WS 消息都触发 zustand set() → React 重渲染
+let _pendingWsMessages: WsProgressMessage[] = [];
+let _wsFlushScheduled = false;
+
+function _scheduleWsFlush(get: () => TransferStore) {
+  if (_wsFlushScheduled) return;
+  _wsFlushScheduled = true;
+  requestAnimationFrame(() => {
+    _wsFlushScheduled = false;
+    const messages = _pendingWsMessages;
+    _pendingWsMessages = [];
+    if (messages.length === 0) return;
+    _applyWsBatch(get, messages);
+  });
+}
+
+function _applyWsBatch(get: () => TransferStore, messages: WsProgressMessage[]) {
+  const store = get();
+  let needsFullReload = false;
+
+  // 按 upload_id 合并：同一个 task 的多条 progress 只保留最后一条
+  const mergedByUploadId = new Map<string, WsProgressMessage>();
+  const otherMessages: WsProgressMessage[] = [];
+
+  for (const msg of messages) {
+    // 需要全量刷新的消息类型
+    if (
+      msg.type === "all_paused" ||
+      msg.type === "all_resumed" ||
+      msg.type === "queue_cleared" ||
+      msg.type === "all_uploads_complete" ||
+      msg.type === "messages_lagged" ||
+      msg.type === "task_reinit"
+    ) {
+      needsFullReload = true;
+      continue;
+    }
+
+    // upload_queued / upload_instant 表示有新任务入队
+    // 不立即 reload，累积后由 all_uploads_complete 或定时刷新处理
+    // 避免 60000 文件 init 阶段每个文件都触发 loadTasks
+    if (msg.type === "upload_queued" || msg.type === "upload_instant") {
+      needsFullReload = true;
+      continue;
+    }
+
+    if (msg.upload_id) {
+      // 同一个 upload_id 的消息，后面的覆盖前面的（progress 取最新值）
+      const existing = mergedByUploadId.get(msg.upload_id);
+      if (existing) {
+        // 状态变更优先级：completed > cancelled > paused > running > pending
+        // 如果新消息是 completed/cancelled，覆盖旧的 progress
+        if (msg.type === "completed" || msg.type === "task_cancelled") {
+          mergedByUploadId.set(msg.upload_id, msg);
+        } else if (existing.type !== "completed" && existing.type !== "task_cancelled") {
+          mergedByUploadId.set(msg.upload_id, msg);
+        }
+      } else {
+        mergedByUploadId.set(msg.upload_id, msg);
+      }
+    } else {
+      otherMessages.push(msg);
+    }
+  }
+
+  // 应用合并后的消息到 tasks 数组
+  if (mergedByUploadId.size > 0) {
+    useTransferStore.setState((state) => {
+      const tasks = [...state.tasks];
+      let changed = false;
+
+      for (const [uploadId, msg] of mergedByUploadId) {
+        const idx = tasks.findIndex((t) => t.upload_id === uploadId);
+        if (idx === -1) {
+          // 未知任务：只有状态变更消息才触发 reload（新任务开始上传）
+          // progress 和 completed 消息对于不在列表中的任务忽略，
+          // 避免 60000 文件场景下不断触发全量刷新
+          if (msg.type === "upload_start") {
+            needsFullReload = true;
+          }
+          continue;
+        }
+
+        const task = { ...tasks[idx] };
+        let taskChanged = false;
+
+        switch (msg.type) {
+          case "progress":
+          case "upload_progress":
+            if (msg.uploaded_chunks !== undefined && msg.uploaded_chunks !== task.uploaded_chunks) {
+              task.uploaded_chunks = msg.uploaded_chunks;
+              taskChanged = true;
+            }
+            if (msg.total_chunks !== undefined && msg.total_chunks !== task.total_chunks) {
+              task.total_chunks = msg.total_chunks;
+              taskChanged = true;
+            }
+            if (task.status !== "running") {
+              task.status = "running";
+              taskChanged = true;
+            }
+            break;
+          case "completed":
+          case "upload_complete":
+            if (task.status !== "completed") {
+              task.status = "completed";
+              task.uploaded_chunks = task.total_chunks;
+              taskChanged = true;
+            }
+            break;
+          case "task_status":
+            if (msg.status && task.status !== msg.status) {
+              task.status = msg.status as TaskStatus;
+              taskChanged = true;
+            }
+            break;
+          case "task_cancelled":
+            if (task.status !== "cancelled") {
+              task.status = "cancelled";
+              taskChanged = true;
+            }
+            break;
+          case "upload_start":
+            if (task.status !== "running") {
+              task.status = "running";
+              taskChanged = true;
+            }
+            if (msg.total_chunks !== undefined && msg.total_chunks !== task.total_chunks) {
+              task.total_chunks = msg.total_chunks;
+              taskChanged = true;
+            }
+            break;
+          case "paused":
+            if (task.status !== "paused") {
+              task.status = "paused";
+              taskChanged = true;
+            }
+            break;
+          case "resumed":
+            if (task.status !== "pending") {
+              task.status = "pending";
+              taskChanged = true;
+            }
+            break;
+        }
+
+        if (taskChanged) {
+          tasks[idx] = task;
+          changed = true;
+        }
+      }
+
+      return changed ? { tasks } : state;
+    });
+  }
+
+  if (needsFullReload) {
+    // 使用较长的防抖间隔（1.5秒），避免 init 阶段高频 upload_queued 消息
+    // 不断触发 loadTasks 导致 IPC 拥堵
+    _debouncedLoadTasks(get, 1500);
+  }
 }
 
 export const useTransferStore = create<TransferStore>((set, get) => ({
@@ -89,11 +259,15 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
   loginSuccessToast: false,
 
   loadTasks: async () => {
+    if (_loadTasksInFlight) return; // 防止并发调用
+    _loadTasksInFlight = true;
     try {
       const tasks = await invoke<TransferTask[]>("get_tasks");
       set({ tasks });
     } catch (err) {
       console.error("Failed to load tasks:", err);
+    } finally {
+      _loadTasksInFlight = false;
     }
   },
 
@@ -263,71 +437,10 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
   },
 
   _updateTaskFromWs: (msg: WsProgressMessage) => {
-    set((state) => {
-      // 这些消息没有 upload_id，或需要全量刷新
-      if (
-        msg.type === "all_paused" ||
-        msg.type === "all_resumed" ||
-        msg.type === "queue_cleared" ||
-        msg.type === "upload_queued" ||
-        msg.type === "upload_instant" ||
-        msg.type === "all_uploads_complete" ||
-        msg.type === "messages_lagged" ||
-        msg.type === "task_reinit"
-      ) {
-        // 使用防抖避免短时间内多次 loadTasks
-        _debouncedLoadTasks(get);
-        return state;
-      }
-
-      const tasks = [...state.tasks];
-      const idx = tasks.findIndex((t) => t.upload_id === msg.upload_id);
-
-      if (idx === -1) {
-        // Unknown task, trigger reload (debounced)
-        _debouncedLoadTasks(get);
-        return state;
-      }
-
-      const task = { ...tasks[idx] };
-
-      switch (msg.type) {
-        // 后端广播的进度消息类型是 "progress"
-        case "progress":
-        case "upload_progress":
-          task.uploaded_chunks = msg.uploaded_chunks ?? task.uploaded_chunks;
-          task.total_chunks = msg.total_chunks ?? task.total_chunks;
-          task.status = "running";
-          break;
-        // 后端广播的完成消息类型是 "completed"
-        case "completed":
-        case "upload_complete":
-          task.status = "completed";
-          task.uploaded_chunks = task.total_chunks;
-          break;
-        case "task_status":
-          if (msg.status) {
-            task.status = msg.status as TaskStatus;
-          }
-          break;
-        case "task_cancelled":
-          task.status = "cancelled";
-          break;
-        case "upload_start":
-          task.status = "running";
-          task.total_chunks = msg.total_chunks ?? task.total_chunks;
-          break;
-        case "paused":
-          task.status = "paused";
-          break;
-        case "resumed":
-          task.status = "pending";
-          break;
-      }
-
-      tasks[idx] = task;
-      return { tasks };
-    });
+    // 将消息放入待处理队列，由 requestAnimationFrame 批量处理
+    // 这样一帧内收到的多条消息只触发一次 React 重渲染
+    _pendingWsMessages.push(msg);
+    _scheduleWsFlush(get);
   },
 }));
 

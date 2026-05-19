@@ -1,8 +1,37 @@
-import React, { useEffect, useState, useMemo, useCallback } from "react";
+import React, { useEffect, useState, useMemo, useCallback, useRef, CSSProperties, ReactElement } from "react";
+import { List } from "react-window";
 import { TransferItem } from "../components/TransferItem";
-import { useTransferStore } from "../stores/transfer";
+import { useTransferStore, TransferTask } from "../stores/transfer";
 
 const REFRESH_INTERVAL = 5000; // Reduced polling frequency — WS handles real-time updates
+const ITEM_HEIGHT = 120; // 每个 TransferItem 的固定高度（含 margin）
+
+// react-window v2 的 rowComponent 需要是独立组件
+interface VirtualRowProps {
+  tasks: TransferTask[];
+  onCancel: (uploadId: string) => void;
+  onPause: (uploadId: string) => void;
+  onResume: (uploadId: string) => void;
+}
+
+function VirtualRow({ ariaAttributes, index, style, tasks, onCancel, onPause, onResume }: {
+  ariaAttributes: { "aria-posinset": number; "aria-setsize": number; role: "listitem" };
+  index: number;
+  style: CSSProperties;
+} & VirtualRowProps): ReactElement | null {
+  const task = tasks[index];
+  if (!task) return null;
+  return (
+    <div style={{ ...style, padding: "0 16px" }} {...ariaAttributes}>
+      <TransferItem
+        task={task}
+        onCancel={onCancel}
+        onPause={onPause}
+        onResume={onResume}
+      />
+    </div>
+  );
+}
 
 export const TransferQueue: React.FC = () => {
   const {
@@ -27,6 +56,22 @@ export const TransferQueue: React.FC = () => {
   } = useTransferStore();
 
   const [filter, setFilter] = useState<"all" | "active" | "done" | "failed" | "cancelled">("all");
+  const [listHeight, setListHeight] = useState(400);
+  const listContainerRef = useRef<HTMLDivElement | null>(null);
+
+  // 监听容器高度变化
+  useEffect(() => {
+    const el = listContainerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setListHeight(entry.contentRect.height);
+      }
+    });
+    observer.observe(el);
+    setListHeight(el.clientHeight);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     checkAuth();
@@ -515,11 +560,11 @@ export const TransferQueue: React.FC = () => {
 
       {/* Task list */}
       <div
+        ref={listContainerRef}
         style={{
           flex: 1,
-          overflowY: "auto",
-          padding: "12px 16px",
           position: "relative",
+          overflow: "hidden",
         }}
       >
         {/* 未登录遮罩 */}
@@ -599,15 +644,19 @@ export const TransferQueue: React.FC = () => {
             </div>
           </div>
         ) : (
-          filteredTasks.map((task) => (
-            <TransferItem
-              key={task.upload_id}
-              task={task}
-              onCancel={cancelTask}
-              onPause={pauseTask}
-              onResume={resumeTask}
-            />
-          ))
+          <List
+            rowComponent={VirtualRow}
+            rowCount={filteredTasks.length}
+            rowHeight={ITEM_HEIGHT}
+            rowProps={{
+              tasks: filteredTasks,
+              onCancel: cancelTask,
+              onPause: pauseTask,
+              onResume: resumeTask,
+            }}
+            overscanCount={10}
+            style={{ height: listHeight, width: "100%" }}
+          />
         )}
       </div>
 

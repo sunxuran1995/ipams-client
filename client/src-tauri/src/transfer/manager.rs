@@ -232,15 +232,86 @@ fn load_tasks_from_disk() -> HashMap<String, TransferTask> {
 /// This prevents the async runtime from stalling on disk writes, which was
 /// causing FILE_UPLOAD_SEMAPHORE permits to be held indefinitely while
 /// update_task_status / progress callbacks queued up behind a slow write lock.
+///
+/// 优化：使用合并写盘（coalescing）机制。当 store 中有数万条任务时，
+/// 每次 serde_json::to_string 可能耗时数百毫秒，频繁调用会导致写锁被
+/// 长时间持有（因为序列化在持有锁期间执行），进而阻塞 init/upload pipeline。
+/// 现在改为：标记脏位 + 延迟合并写盘，避免每次状态变更都做全量序列化。
 fn save_tasks_async(store: &HashMap<String, TransferTask>) {
-    if let Ok(json) = serde_json::to_string(store) {
-        let path = store_path();
-        tokio::task::spawn_blocking(move || {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+    // 标记有脏数据，由定期 flush 任务负责实际写盘
+    SAVE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+
+    // 如果当前没有写盘操作在进行，且距离上次写盘已超过阈值，立即触发一次
+    let now = std::time::Instant::now();
+    let last = LAST_SAVE_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let elapsed = now.duration_since(*last);
+    drop(last);
+
+    // 至少间隔 1 秒才做一次全量序列化写盘
+    if elapsed >= std::time::Duration::from_secs(1) {
+        if SAVE_IN_FLIGHT.compare_exchange(
+            false, true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ).is_ok() {
+            SAVE_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+            if let Ok(json) = serde_json::to_string(store) {
+                let path = store_path();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&path, json);
+                    SAVE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+                    *LAST_SAVE_TIME.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+                });
+            } else {
+                SAVE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
             }
-            let _ = std::fs::write(&path, json);
-        });
+        }
+    }
+}
+
+/// 是否有未写盘的脏数据
+static SAVE_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 是否有写盘操作正在进行
+static SAVE_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 上次写盘时间
+static LAST_SAVE_TIME: Lazy<std::sync::Mutex<std::time::Instant>> =
+    Lazy::new(|| std::sync::Mutex::new(std::time::Instant::now()));
+
+/// 定期检查是否有待刷盘的数据（由 app 启动时 spawn）。
+/// 每 2 秒检查一次 dirty 标志，有脏数据则获取读锁序列化写盘。
+/// 这样即使 save_tasks_async 因为节流跳过了写盘，数据也不会丢失。
+pub async fn start_periodic_flush() {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if !SAVE_DIRTY.load(std::sync::atomic::Ordering::Acquire) {
+            continue;
+        }
+        if SAVE_IN_FLIGHT.compare_exchange(
+            false, true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ).is_err() {
+            continue; // 有写盘正在进行，下次再试
+        }
+        SAVE_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+        let store = TASK_STORE.read().await;
+        if let Ok(json) = serde_json::to_string(&*store) {
+            drop(store); // 尽快释放读锁
+            let path = store_path();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&path, json);
+            }).await;
+        } else {
+            drop(store);
+        }
+        SAVE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+        *LAST_SAVE_TIME.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
     }
 }
 
@@ -520,25 +591,25 @@ async fn start_upload(
     let store_ref = TASK_STORE.clone();
     let upload_id_cb = upload_id.clone();
 
-    // 节流：每 5 个分片或最后一个分片才写磁盘，减少锁竞争和 I/O
+    // 节流：每 10 个分片或最后一个分片才获取写锁更新 store，减少锁竞争
     let last_saved_chunk = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let result = uploader
         .run_upload(file_path, &detail, cancel_token.clone(), move |uploaded, total| {
             let store = store_ref.clone();
             let uid = upload_id_cb.clone();
             let last_saved = last_saved_chunk.clone();
-            tokio::spawn(async move {
-                let mut s = store.write().await;
-                if let Some(t) = s.get_mut(&uid) {
-                    t.uploaded_chunks = uploaded;
-                }
-                // 只在每 5 个分片、或最后一个分片时写磁盘
-                let prev = last_saved.load(std::sync::atomic::Ordering::Relaxed);
-                if uploaded >= total || uploaded.saturating_sub(prev) >= 5 {
-                    last_saved.store(uploaded, std::sync::atomic::Ordering::Relaxed);
+            let prev = last_saved.load(std::sync::atomic::Ordering::Relaxed);
+            let should_persist = uploaded >= total || uploaded.saturating_sub(prev) >= 10;
+            if should_persist {
+                last_saved.store(uploaded, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut s = store.write().await;
+                    if let Some(t) = s.get_mut(&uid) {
+                        t.uploaded_chunks = uploaded;
+                    }
                     save_tasks_async(&s);
-                }
-            });
+                });
+            }
         })
         .await;
 
@@ -655,17 +726,20 @@ async fn start_upload_chunks(
             let store = store_ref.clone();
             let uid = upload_id_cb.clone();
             let last_saved = last_saved_chunk.clone();
-            tokio::spawn(async move {
-                let mut s = store.write().await;
-                if let Some(t) = s.get_mut(&uid) {
-                    t.uploaded_chunks = uploaded;
-                }
-                let prev = last_saved.load(std::sync::atomic::Ordering::Relaxed);
-                if uploaded >= total || uploaded.saturating_sub(prev) >= 5 {
-                    last_saved.store(uploaded, std::sync::atomic::Ordering::Relaxed);
+            // 节流：只在每 10 个分片、或最后一个分片时才获取写锁更新 store
+            // 对于小文件（1-2 chunks）仍然会在最后一个 chunk 时更新
+            let prev = last_saved.load(std::sync::atomic::Ordering::Relaxed);
+            let should_persist = uploaded >= total || uploaded.saturating_sub(prev) >= 10;
+            if should_persist {
+                last_saved.store(uploaded, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut s = store.write().await;
+                    if let Some(t) = s.get_mut(&uid) {
+                        t.uploaded_chunks = uploaded;
+                    }
                     save_tasks_async(&s);
-                }
-            });
+                });
+            }
         })
         .await;
 
@@ -1236,7 +1310,9 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
         let mut file_iter = files_to_upload.into_iter();
         let mut batch_tasks: Vec<TransferTask> = Vec::new();
         // 批量写盘阈值：每积累 BATCH_WRITE_SIZE 个任务写一次磁盘
-        const BATCH_WRITE_SIZE: usize = 100;
+        // 60000 文件场景下，100 太小（600 次全量序列化），改为 500
+        // 配合 save_tasks_async 的 1 秒节流，实际写盘频率更低
+        const BATCH_WRITE_SIZE: usize = 500;
 
         // 填满初始并发槽
         for _ in 0..MAX_CONCURRENT_INIT {
@@ -1308,19 +1384,15 @@ pub async fn enqueue_upload_by_params<R: Runtime>(
 
                         // 检查全局取消/暂停标志
                         if GLOBAL_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
-                            // 不再发送到上传通道，标记为已取消
-                            let mut store = TASK_STORE.write().await;
-                            if let Some(t) = store.get_mut(&upload_id) {
+                            // 不再发送到上传通道，直接修改本地 batch 中的状态
+                            if let Some(t) = batch_tasks.last_mut() {
                                 t.status = TaskStatus::Cancelled;
                             }
-                            save_tasks_async(&store);
                         } else if GLOBAL_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
                             // 不发送到上传通道，标记为暂停状态
-                            let mut store = TASK_STORE.write().await;
-                            if let Some(t) = store.get_mut(&upload_id) {
+                            if let Some(t) = batch_tasks.last_mut() {
                                 t.status = TaskStatus::Paused;
                             }
-                            save_tasks_async(&store);
                             PAUSED_SET.write().await.insert(upload_id.clone());
                         } else {
                             // 发送到上传通道，同时监听取消（通道满时背压等待，取消时立即放弃）
