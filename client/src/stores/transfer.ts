@@ -19,6 +19,7 @@ export interface TransferTask {
   status: TaskStatus;
   error?: string;
   created_at: number;
+  retry_count?: number;
 }
 
 export interface AppConfig {
@@ -56,6 +57,7 @@ interface TransferStore {
   resumeAll: () => Promise<void>;
   cancelAll: () => Promise<void>;
   retryAll: () => Promise<void>;
+  clearCompleted: () => Promise<void>;
   loadConfig: () => Promise<void>;
   checkAuth: () => Promise<void>;
   connectWs: () => void;
@@ -65,6 +67,16 @@ interface TransferStore {
 
   // Internal
   _updateTaskFromWs: (msg: WsProgressMessage) => void;
+}
+
+// 防抖 loadTasks：避免短时间内多次 WS 消息触发重复全量刷新
+let _loadTasksTimer: ReturnType<typeof setTimeout> | null = null;
+function _debouncedLoadTasks(get: () => TransferStore) {
+  if (_loadTasksTimer) clearTimeout(_loadTasksTimer);
+  _loadTasksTimer = setTimeout(() => {
+    _loadTasksTimer = null;
+    get().loadTasks();
+  }, 300);
 }
 
 export const useTransferStore = create<TransferStore>((set, get) => ({
@@ -120,6 +132,10 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
   resumeAll: async () => {
     await invoke<void>("resume_all_tasks");
     await get().loadTasks();
+    // resume_task 是异步 fire-and-forget，状态变更有延迟，多次刷新兜底
+    setTimeout(() => get().loadTasks(), 800);
+    setTimeout(() => get().loadTasks(), 2000);
+    setTimeout(() => get().loadTasks(), 4000);
   },
 
   cancelAll: async () => {
@@ -129,11 +145,26 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
 
   retryAll: async () => {
     const { tasks } = get();
-    const targets = tasks.filter((t) => t.status === "failed");
-    await Promise.allSettled(
-      targets.map((t) => invoke<boolean>("resume_task", { uploadId: t.upload_id }))
-    );
+    // 重试失败的任务，同时恢复卡在等待中的孤立任务
+    const targets = tasks.filter((t) => t.status === "failed" || t.status === "pending");
+    // 分批调用，避免同时发起数千个 IPC 请求
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < targets.length; i += BATCH_SIZE) {
+      const batch = targets.slice(i, i + BATCH_SIZE);
+      await Promise.allSettled(
+        batch.map((t) => invoke<boolean>("resume_task", { uploadId: t.upload_id }))
+      );
+    }
     await get().loadTasks();
+  },
+
+  clearCompleted: async () => {
+    try {
+      await invoke<void>("clear_completed_tasks");
+      await get().loadTasks();
+    } catch (err) {
+      console.error("Failed to clear completed tasks:", err);
+    }
   },
 
   loadConfig: async () => {
@@ -233,23 +264,43 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
 
   _updateTaskFromWs: (msg: WsProgressMessage) => {
     set((state) => {
+      // 这些消息没有 upload_id，或需要全量刷新
+      if (
+        msg.type === "all_paused" ||
+        msg.type === "all_resumed" ||
+        msg.type === "queue_cleared" ||
+        msg.type === "upload_queued" ||
+        msg.type === "upload_instant" ||
+        msg.type === "all_uploads_complete" ||
+        msg.type === "messages_lagged" ||
+        msg.type === "task_reinit"
+      ) {
+        // 使用防抖避免短时间内多次 loadTasks
+        _debouncedLoadTasks(get);
+        return state;
+      }
+
       const tasks = [...state.tasks];
       const idx = tasks.findIndex((t) => t.upload_id === msg.upload_id);
 
       if (idx === -1) {
-        // Unknown task, trigger reload
-        setTimeout(() => get().loadTasks(), 100);
+        // Unknown task, trigger reload (debounced)
+        _debouncedLoadTasks(get);
         return state;
       }
 
       const task = { ...tasks[idx] };
 
       switch (msg.type) {
+        // 后端广播的进度消息类型是 "progress"
+        case "progress":
         case "upload_progress":
           task.uploaded_chunks = msg.uploaded_chunks ?? task.uploaded_chunks;
           task.total_chunks = msg.total_chunks ?? task.total_chunks;
           task.status = "running";
           break;
+        // 后端广播的完成消息类型是 "completed"
+        case "completed":
         case "upload_complete":
           task.status = "completed";
           task.uploaded_chunks = task.total_chunks;
@@ -265,6 +316,12 @@ export const useTransferStore = create<TransferStore>((set, get) => ({
         case "upload_start":
           task.status = "running";
           task.total_chunks = msg.total_chunks ?? task.total_chunks;
+          break;
+        case "paused":
+          task.status = "paused";
+          break;
+        case "resumed":
+          task.status = "pending";
           break;
       }
 

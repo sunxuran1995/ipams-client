@@ -51,6 +51,12 @@ async fn cancel_all_tasks() -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn clear_completed_tasks() -> Result<(), String> {
+    manager::clear_completed_tasks().await;
+    Ok(())
+}
+
+#[tauri::command]
 fn get_config() -> AppConfig {
     config::get_config()
 }
@@ -261,15 +267,12 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Intercept close → pause all tasks, then hide to tray
+            // Intercept close → hide to tray, keep uploads running in background
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
-                // 隐藏到托盘时暂停所有正在上传的任务
-                tauri::async_runtime::spawn(async move {
-                    tracing::info!("Window hidden, pausing all active uploads");
-                    transfer::manager::pause_all_tasks().await;
-                });
+                // 不暂停上传，让任务继续在后台运行
+                tracing::info!("Window hidden, uploads continue in background");
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -280,6 +283,7 @@ pub fn run() {
             pause_all_tasks,
             resume_all_tasks,
             cancel_all_tasks,
+            clear_completed_tasks,
             get_config,
             get_token,
             get_current_username,

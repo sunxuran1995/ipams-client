@@ -39,6 +39,9 @@ pub struct TransferTask {
     /// 上传目标文件夹 ID
     #[serde(default)]
     pub folder_id: Option<String>,
+    /// 已重试次数，达到 MAX_RETRY_COUNT 后才进入失败列表
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 impl TransferTask {

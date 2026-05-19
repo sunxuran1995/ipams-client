@@ -17,7 +17,7 @@ pub struct WsServer {
 }
 
 static WS_SERVER: Lazy<Arc<WsServer>> = Lazy::new(|| {
-    let (tx, _) = broadcast::channel(256);
+    let (tx, _) = broadcast::channel(4096);
     Arc::new(WsServer { tx })
 });
 
@@ -100,6 +100,14 @@ async fn handle_ws(stream: TcpStream, server: Arc<WsServer>) -> Result<()> {
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("WS client {} lagged {} messages", id, n);
+                        // 通知客户端消息丢失，应全量刷新任务列表
+                        let reload_msg = serde_json::json!({
+                            "type": "messages_lagged",
+                            "count": n
+                        });
+                        if write.send(Message::Text(reload_msg.to_string())).await.is_err() {
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }

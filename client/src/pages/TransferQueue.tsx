@@ -1,8 +1,8 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useMemo, useCallback } from "react";
 import { TransferItem } from "../components/TransferItem";
 import { useTransferStore } from "../stores/transfer";
 
-const REFRESH_INTERVAL = 2000;
+const REFRESH_INTERVAL = 5000; // Reduced polling frequency — WS handles real-time updates
 
 export const TransferQueue: React.FC = () => {
   const {
@@ -19,6 +19,7 @@ export const TransferQueue: React.FC = () => {
     resumeAll,
     cancelAll,
     retryAll,
+    clearCompleted,
     checkAuth,
     connectWs,
     openLoginPage,
@@ -42,7 +43,7 @@ export const TransferQueue: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
-  const filteredTasks = tasks.filter((t) => {
+  const filteredTasks = useMemo(() => tasks.filter((t) => {
     if (filter === "active")
       return t.status === "pending" || t.status === "running" || t.status === "paused";
     if (filter === "done")
@@ -52,23 +53,27 @@ export const TransferQueue: React.FC = () => {
     if (filter === "cancelled")
       return t.status === "cancelled";
     return true;
-  });
+  }), [tasks, filter]);
 
-  const activeCount = tasks.filter(
+  const activeCount = useMemo(() => tasks.filter(
     (t) => t.status === "pending" || t.status === "running" || t.status === "paused"
-  ).length;
+  ).length, [tasks]);
 
-  const completedCount = tasks.filter((t) => t.status === "completed").length;
+  const completedCount = useMemo(() => tasks.filter((t) => t.status === "completed").length, [tasks]);
 
-  const failedCount = tasks.filter((t) => t.status === "failed").length;
+  const failedCount = useMemo(() => tasks.filter((t) => t.status === "failed").length, [tasks]);
 
-  const cancelledCount = tasks.filter((t) => t.status === "cancelled").length;
+  const cancelledCount = useMemo(() => tasks.filter((t) => t.status === "cancelled").length, [tasks]);
 
-  const pausedCount = tasks.filter((t) => t.status === "paused").length;
+  const pausedCount = useMemo(() => tasks.filter((t) => t.status === "paused").length, [tasks]);
 
-  const hasCancellable = tasks.some(
+  const hasCancellable = useMemo(() => tasks.some(
     (t) => t.status === "running" || t.status === "pending" || t.status === "paused"
-  );
+  ), [tasks]);
+
+  const hasClearable = useMemo(() => tasks.some(
+    (t) => t.status === "completed" || t.status === "cancelled" || t.status === "failed"
+  ), [tasks]);
 
   return (
     <div
@@ -464,6 +469,43 @@ export const TransferQueue: React.FC = () => {
                     <path d="M3.51 15a9 9 0 1 0 .49-4.5" />
                   </svg>
                   全部重试
+                </button>
+              )}
+
+              {hasClearable && (
+                <button
+                  onClick={clearCompleted}
+                  title="清空已完成/已取消/已失败的记录"
+                  style={{
+                    background: "transparent",
+                    border: "1px solid #374151",
+                    color: "#9ca3af",
+                    borderRadius: 6,
+                    padding: "3px 10px",
+                    fontSize: 12,
+                    cursor: "pointer",
+                    transition: "all 0.2s",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = "#6b7280";
+                    e.currentTarget.style.color = "#e5e7eb";
+                    e.currentTarget.style.background = "rgba(107,114,128,0.1)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = "#374151";
+                    e.currentTarget.style.color = "#9ca3af";
+                    e.currentTarget.style.background = "transparent";
+                  }}
+                >
+                  {/* trash icon */}
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="3 6 5 6 21 6" />
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  </svg>
+                  清空列表
                 </button>
               )}
             </div>

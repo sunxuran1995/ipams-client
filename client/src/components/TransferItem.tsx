@@ -45,7 +45,7 @@ function formatTime(ts: number): string {
   });
 }
 
-export const TransferItem: React.FC<Props> = ({ task, onCancel, onPause, onResume }) => {
+export const TransferItem: React.FC<Props> = React.memo(({ task, onCancel, onPause, onResume }) => {
   const percent =
     task.total_chunks > 0
       ? Math.round((task.uploaded_chunks / task.total_chunks) * 100)
@@ -263,4 +263,6 @@ export const TransferItem: React.FC<Props> = ({ task, onCancel, onPause, onResum
       )}
     </div>
   );
-};
+});
+
+TransferItem.displayName = 'TransferItem';
